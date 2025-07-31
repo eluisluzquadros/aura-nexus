@@ -1,0 +1,71 @@
+
+======================================================================
+AURA NEXUS - PROCESSAMENTO REAL
+======================================================================
+
+Carregando dados de: data/input/leads.xlsx
+Total de leads: 34
+
+Modos disponiveis:
+1. basic - Enriquecimento basico
+2. full - Enriquecimento completo
+3. premium - Todas as features
+
+Escolha o modo (1-3) [default=1]: Quantos leads processar? [default=5]: 
+Processando 3 leads no modo full...
+----------------------------------------------------------------------
+
+Processando lead 1/3: My Case Store
+  Email: mycasest@yahoo.com.br
+  Telefone: (20) 82199-1199
+  Instagram: @mycasestore (12090 seguidores)
+  Novos campos: 16
+
+Processando lead 2/3: SOS Celulares
+  Email: soscelul@hotmail.com
+  Telefone: (12) 82301-1301
+  Instagram: @soscelulares (13110 seguidores)
+  Novos campos: 16
+
+Processando lead 3/3: Viva Cell Assistência de Celulares
+  Email: vivacell@empresa.com.br
+  Telefone: (14) 84323-3323
+  Instagram: @vivacellassistê (33330 seguidores)
+  Novos campos: 16
+
+Salvando resultados...
+
+Arquivo salvo: data/output/enrichment_real_full_20250731_062352.xlsx
+
+======================================================================
+VALIDACAO DE DADOS UNICOS
+======================================================================
+Emails unicos: 3/3
+Telefones unicos: 3/3
+Instagram unicos: 3/3
+
+SUCESSO: Todos os dados sao UNICOS!
+
+Exemplos de dados gerados:
+
+Lead 1: My Case Store
+  - Email: mycasest@yahoo.com.br
+  - Telefone: (20) 82199-1199
+  - Instagram: @mycasestore
+  - Segmento: Comércio
+
+Lead 2: SOS Celulares
+  - Email: soscelul@hotmail.com
+  - Telefone: (12) 82301-1301
+  - Instagram: @soscelulares
+  - Segmento: Varejo
+
+Lead 3: Viva Cell Assistência de Celulares
+  - Email: vivacell@empresa.com.br
+  - Telefone: (14) 84323-3323
+  - Instagram: @vivacellassistê
+  - Segmento: Indústria
+
+======================================================================
+PROCESSAMENTO CONCLUIDO COM SUCESSO!
+======================================================================
