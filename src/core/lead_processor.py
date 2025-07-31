@@ -12,6 +12,7 @@ import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 import pandas as pd
+from ..features.social_scraping import SocialMediaScraper
 
 logger = logging.getLogger("AURA_NEXUS.LeadProcessor")
 
@@ -70,7 +71,16 @@ class LeadProcessor:
         self.reviews_analyzer = config.get('reviews_analyzer')
         self.facade_analyzer = config.get('facade_analyzer')
         self.street_view_analyzer = config.get('street_view_analyzer')
-        self.social_scraper = config.get('social_scraper')
+        # Initialize SocialMediaScraper for enhanced social scraping
+        self.social_scraper = None
+        if self.api_manager:
+            try:
+                self.social_scraper = SocialMediaScraper(self.api_manager)
+                logger.info("✅ SocialMediaScraper v712 inicializado")
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao inicializar SocialMediaScraper: {e}")
+                # Fallback to config social_scraper if available
+                self.social_scraper = config.get('social_scraper')
         
         # Cliente Google Maps
         self.gmaps = self.api_manager.get_client('googlemaps') if self.api_manager else None
@@ -576,12 +586,15 @@ class LeadProcessor:
             logger.error(f"Erro no web scraping: {str(e)}")
     
     async def _perform_social_scraping(self):
-        """Executa scraping de redes sociais"""
+        """Executa scraping das redes sociais usando SocialMediaScraper v712"""
         if not self.social_scraper:
+            logger.warning("SocialMediaScraper não disponível")
             return
         
         try:
-            # Coletar URLs sociais para scraping
+            logger.info("🔍 Executando social scraping com SocialMediaScraper v712...")
+            
+            # URLs sociais para scraping
             social_urls = []
             
             # URLs já conhecidas no GDR
@@ -592,58 +605,113 @@ class LeadProcessor:
             if self.gdr.get('gdr_url_linkedin'):
                 social_urls.append(self.gdr['gdr_url_linkedin'])
             
-            # Buscar URLs adicionais do website
-            if self.gdr.get('gdr_website'):
-                # O scraper irá descobrir links sociais automaticamente
-                pass
-            
             if not social_urls:
                 logger.info("Nenhuma URL social encontrada para scraping")
                 return
             
-            # Processar URLs sociais
-            from aura_nexus_celula_16 import process_social_urls
+            # Executar scraping com SocialMediaScraper
+            from ..features.social_scraping import process_social_urls
+            
             results = await process_social_urls(self.social_scraper, social_urls)
             
-            # Processar resultados por plataforma
-            if 'scraped_data' in results:
-                # Instagram
-                if 'instagram' in results['scraped_data'] and results['scraped_data']['instagram']:
-                    ig_data = results['scraped_data']['instagram'][0]
-                    self.gdr['gdr_instagram_followers'] = ig_data.get('follower_count', 0)
-                    self.gdr['gdr_instagram_bio'] = ig_data.get('biography', '')
-                    if ig_data.get('email'):
-                        self.gdr['gdr_email_instagram'] = ig_data['email']
-                    if ig_data.get('external_url'):
-                        self.gdr['gdr_website_instagram'] = ig_data['external_url']
+            # Processar resultados com campos expandidos
+            if results.get('scraped_data'):
+                scraped_data = results['scraped_data']
                 
-                # Facebook
-                if 'facebook' in results['scraped_data'] and results['scraped_data']['facebook']:
-                    fb_data = results['scraped_data']['facebook'][0]
-                    self.gdr['gdr_facebook_followers'] = fb_data.get('followers', 0)
-                    self.gdr['gdr_facebook_rating'] = fb_data.get('rating', 0)
-                    self.gdr['gdr_facebook_category'] = fb_data.get('category', '')
-                    if fb_data.get('phone'):
-                        self.gdr['gdr_telefone_facebook'] = fb_data['phone']
+                # Instagram - 15+ campos
+                if 'instagram' in scraped_data:
+                    instagram_data = scraped_data['instagram'][0] if scraped_data['instagram'] else {}
+                    self.gdr['gdr_instagram_username'] = instagram_data.get('username', '')
+                    self.gdr['gdr_instagram_full_name'] = instagram_data.get('full_name', '')
+                    self.gdr['gdr_instagram_biography'] = instagram_data.get('biography', '')
+                    self.gdr['gdr_instagram_followers'] = instagram_data.get('follower_count', 0)
+                    self.gdr['gdr_instagram_following'] = instagram_data.get('following_count', 0)
+                    self.gdr['gdr_instagram_posts'] = instagram_data.get('posts_count', 0)
+                    self.gdr['gdr_instagram_verified'] = instagram_data.get('is_verified', False)
+                    self.gdr['gdr_instagram_business'] = instagram_data.get('is_business', False)
+                    self.gdr['gdr_instagram_business_category'] = instagram_data.get('business_category', '')
+                    self.gdr['gdr_instagram_external_url'] = instagram_data.get('external_url', '')
+                    self.gdr['gdr_instagram_profile_pic_url'] = instagram_data.get('profile_pic_url', '')
+                    self.gdr['gdr_instagram_email'] = instagram_data.get('email', '')
+                    self.gdr['gdr_instagram_phone'] = instagram_data.get('phone', '')
+                    self.gdr['gdr_instagram_scraped_at'] = instagram_data.get('scraped_at', '')
+                    self.gdr['gdr_instagram_scraping_method'] = 'SocialMediaScraper_v712'
                 
-                # Linktree
-                if 'linktree' in results['scraped_data'] and results['scraped_data']['linktree']:
-                    lt_data = results['scraped_data']['linktree'][0]
-                    self.gdr['gdr_linktree_links'] = len(lt_data.get('links', []))
-                    # Armazenar links importantes
-                    important_links = []
-                    for link in lt_data.get('links', [])[:5]:  # Top 5 links
-                        important_links.append(f"{link['title']}: {link['url']}")
-                    if important_links:
-                        self.gdr['gdr_linktree_principais'] = ' | '.join(important_links)
-            
-            # Atualizar URLs descobertas
-            if 'discovered_urls' in results:
-                for platform, urls in results['discovered_urls'].items():
-                    if urls and platform == 'website' and not self.gdr.get('gdr_website'):
-                        self.gdr['gdr_website'] = urls[0]
-            
-            logger.info(f"✅ Social scraping concluído: {results['summary']['successful']} sucessos")
+                # Facebook - 15+ campos
+                if 'facebook' in scraped_data:
+                    facebook_data = scraped_data['facebook'][0] if scraped_data['facebook'] else {}
+                    self.gdr['gdr_facebook_name'] = facebook_data.get('name', '')
+                    self.gdr['gdr_facebook_category'] = facebook_data.get('category', '')
+                    self.gdr['gdr_facebook_description'] = facebook_data.get('description', '')
+                    self.gdr['gdr_facebook_likes'] = facebook_data.get('likes', 0)
+                    self.gdr['gdr_facebook_followers'] = facebook_data.get('followers', 0)
+                    self.gdr['gdr_facebook_rating'] = facebook_data.get('rating', 0)
+                    self.gdr['gdr_facebook_rating_count'] = facebook_data.get('rating_count', 0)
+                    self.gdr['gdr_facebook_verified'] = facebook_data.get('is_verified', False)
+                    self.gdr['gdr_facebook_phone'] = facebook_data.get('phone', '')
+                    self.gdr['gdr_facebook_email'] = facebook_data.get('email', '')
+                    self.gdr['gdr_facebook_website'] = facebook_data.get('website', '')
+                    self.gdr['gdr_facebook_address'] = facebook_data.get('address', '')
+                    self.gdr['gdr_facebook_hours'] = facebook_data.get('hours', '')
+                    self.gdr['gdr_facebook_price_range'] = facebook_data.get('price_range', '')
+                    self.gdr['gdr_facebook_scraped_at'] = facebook_data.get('scraped_at', '')
+                    self.gdr['gdr_facebook_scraping_method'] = 'SocialMediaScraper_v712'
+                
+                # LinkedIn - campos básicos  
+                if 'linkedin' in scraped_data:
+                    linkedin_data = scraped_data['linkedin'][0] if scraped_data['linkedin'] else {}
+                    self.gdr['gdr_linkedin_company_slug'] = linkedin_data.get('company_slug', '')
+                    self.gdr['gdr_linkedin_note'] = linkedin_data.get('note', '')
+                    self.gdr['gdr_linkedin_scraped_at'] = linkedin_data.get('scraped_at', '')
+                
+                # TikTok - novos campos suportados
+                if 'tiktok' in scraped_data:
+                    tiktok_data = scraped_data['tiktok'][0] if scraped_data['tiktok'] else {}
+                    self.gdr['gdr_tiktok_username'] = tiktok_data.get('username', '')
+                    self.gdr['gdr_tiktok_nickname'] = tiktok_data.get('nickname', '')
+                    self.gdr['gdr_tiktok_bio'] = tiktok_data.get('bio', '')
+                    self.gdr['gdr_tiktok_followers'] = tiktok_data.get('follower_count', 0)
+                    self.gdr['gdr_tiktok_following'] = tiktok_data.get('following_count', 0)
+                    self.gdr['gdr_tiktok_videos'] = tiktok_data.get('video_count', 0)
+                    self.gdr['gdr_tiktok_hearts'] = tiktok_data.get('heart_count', 0)
+                    self.gdr['gdr_tiktok_verified'] = tiktok_data.get('is_verified', False)
+                    self.gdr['gdr_tiktok_avatar_url'] = tiktok_data.get('avatar_url', '')
+                    self.gdr['gdr_tiktok_scraped_at'] = tiktok_data.get('scraped_at', '')
+                
+                # Linktree - novos campos suportados
+                if 'linktree' in scraped_data:
+                    linktree_data = scraped_data['linktree'][0] if scraped_data['linktree'] else {}
+                    self.gdr['gdr_linktree_username'] = linktree_data.get('username', '')
+                    self.gdr['gdr_linktree_title'] = linktree_data.get('title', '')
+                    self.gdr['gdr_linktree_description'] = linktree_data.get('description', '')
+                    self.gdr['gdr_linktree_total_links'] = len(linktree_data.get('links', []))
+                    self.gdr['gdr_linktree_scraped_at'] = linktree_data.get('scraped_at', '')
+                
+                # Estatísticas detalhadas
+                stats = self.social_scraper.get_statistics() if hasattr(self.social_scraper, 'get_statistics') else {}
+                self.gdr['gdr_social_scraping_success_rate'] = stats.get('success_rate', 0)
+                self.gdr['gdr_social_scraping_total_attempts'] = stats.get('total_attempts', 0)
+                self.gdr['gdr_social_scraping_successful'] = stats.get('successful_scrapes', 0)
+                self.gdr['gdr_social_scraping_failed'] = stats.get('failed_scrapes', 0)
+                self.gdr['gdr_social_scraping_platforms'] = len(scraped_data.keys())
+                
+                # URLs descobertas
+                discovered_urls = results.get('discovered_urls', {})
+                if 'website' in discovered_urls:
+                    websites = discovered_urls['website']
+                    if websites and not self.gdr.get('gdr_website'):
+                        self.gdr['gdr_website'] = websites[0]
+                
+                # Contar campos preenchidos para validação
+                social_fields_filled = 0
+                for key, value in self.gdr.items():
+                    if key.startswith('gdr_instagram_') or key.startswith('gdr_facebook_') or key.startswith('gdr_tiktok_') or key.startswith('gdr_linktree_'):
+                        if value and str(value).strip():
+                            social_fields_filled += 1
+                
+                self.gdr['gdr_social_fields_total'] = social_fields_filled
+                
+                logger.info(f"✅ Social scraping concluído: {results['summary']['successful']}/{results['summary']['total_urls']} sucessos, {social_fields_filled} campos preenchidos")
             
         except Exception as e:
             logger.error(f"Erro no social scraping: {str(e)}")

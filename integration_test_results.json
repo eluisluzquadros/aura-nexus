@@ -1,0 +1,72 @@
+{
+  "test_timestamp": "2025-07-31T02:20:32.077179",
+  "dependencies": {
+    "statistical_libs": true,
+    "web_scraping_libs": false,
+    "web_scraping_error": "No module named 'beautifulsoup4'",
+    "excel_libs": true,
+    "apify_client": true
+  },
+  "pipeline": {
+    "test_1": {
+      "features": [
+        "google_details"
+      ],
+      "original_columns": 7,
+      "enriched_columns": 36,
+      "data_expansion_rate": 514.2857142857143,
+      "has_google_data": false,
+      "has_website_data": false,
+      "has_contact_data": false,
+      "success": true
+    },
+    "test_2": {
+      "features": [
+        "web_scraping"
+      ],
+      "original_columns": 7,
+      "enriched_columns": 36,
+      "data_expansion_rate": 514.2857142857143,
+      "has_google_data": false,
+      "has_website_data": false,
+      "has_contact_data": false,
+      "success": true
+    },
+    "test_3": {
+      "features": [
+        "contact_extraction"
+      ],
+      "original_columns": 7,
+      "enriched_columns": 40,
+      "data_expansion_rate": 571.4285714285714,
+      "has_google_data": false,
+      "has_website_data": false,
+      "has_contact_data": true,
+      "success": true
+    },
+    "test_4": {
+      "features": [
+        "google_details",
+        "web_scraping",
+        "contact_extraction"
+      ],
+      "original_columns": 7,
+      "enriched_columns": 40,
+      "data_expansion_rate": 571.4285714285714,
+      "has_google_data": false,
+      "has_website_data": false,
+      "has_contact_data": true,
+      "success": true
+    }
+  },
+  "excel_output": {
+    "total_columns": 18,
+    "organized_categories": 6,
+    "google_maps_columns": 3,
+    "website_columns": 3,
+    "social_columns": 3,
+    "contact_columns": 2,
+    "processing_columns": 5,
+    "success": true
+  }
+}

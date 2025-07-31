@@ -1,614 +1,444 @@
 # -*- coding: utf-8 -*-
 """
-AURA NEXUS v24.4 - CÉLULA 00: CONFIGURAÇÕES E CLASSES BASE
-Classes fundamentais e configurações do sistema
+AURA NEXUS - Gerenciador de APIs
+Centraliza o gerenciamento de todas as APIs externas
 """
+
 import os
-import json
-import logging
-from typing import Dict, List, Optional, Any, Union
-from dataclasses import dataclass
 import asyncio
-from datetime import datetime
-
-
-import os
+import aiohttp
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
 import logging
-from typing import Dict, List, Optional, Any, Union
-from dataclasses import dataclass, field
-from datetime import datetime
-import json
-from pathlib import Path
+from dotenv import load_dotenv
+import googlemaps
+import openai
+from anthropic import Anthropic
+import google.generativeai as genai
 
-# ===================================================================================
-# CONFIGURAÇÕES GLOBAIS DO SISTEMA
-# ===================================================================================
+# Carrega variáveis de ambiente
+load_dotenv()
 
-# Configurações de diretórios
-BASE_DIR = Path("/content/drive/MyDrive/AURA_NEXUS")
-OUTPUT_DIR = BASE_DIR / "outputs"
-CACHE_DIR = BASE_DIR / "cache"
-CHECKPOINT_DIR = BASE_DIR / "checkpoints"
-LOGS_DIR = BASE_DIR / "logs"
-DATA_DIR = BASE_DIR / "data"
+logger = logging.getLogger("AURA_NEXUS.APIManager")
 
-# Configurações de LLM
-LLM_CONFIG = {
-    "gemini": {
-        "models": {
-            "flash": "gemini-1.5-flash",
-            "pro": "gemini-1.5-pro"
-        },
-        "default_model": "gemini-1.5-flash",
-        "max_tokens": 8192,
-        "temperature": 0.7,
-        "timeout": 60
-    },
-    "claude": {
-        "models": {
-            "sonnet": "claude-3-sonnet-20240229",
-            "haiku": "claude-3-haiku-20240307"
-        },
-        "default_model": "claude-3-sonnet-20240229",
-        "max_tokens": 4096,
-        "temperature": 0.7,
-        "timeout": 60
-    },
-    "openai": {
-        "models": {
-            "gpt4": "gpt-4-turbo-preview",
-            "gpt35": "gpt-3.5-turbo"
-        },
-        "default_model": "gpt-3.5-turbo",
-        "max_tokens": 4096,
-        "temperature": 0.7,
-        "timeout": 60
-    },
-    "deepseek": {
-        "models": {
-            "chat": "deepseek-chat",
-            "coder": "deepseek-coder"
-        },
-        "default_model": "deepseek-chat",
-        "max_tokens": 4096,
-        "temperature": 0.7,
-        "timeout": 60,
-        "api_base": "https://api.deepseek.com/v1"
-    }
-}
 
-# Configurações de processamento
-PROCESSING_CONFIG = {
-    "batch_size": 10,
-    "max_concurrent_requests": 5,
-    "retry_attempts": 3,
-    "retry_delay": 2,
-    "checkpoint_frequency": 5,
-    "max_workers": 10
-}
+class RateLimiter:
+    """Controla rate limits por API"""
+    
+    def __init__(self, max_per_minute: int = 60):
+        self.max_per_minute = max_per_minute
+        self.calls = []
+        self._lock = asyncio.Lock()
+    
+    async def wait_if_needed(self):
+        """Espera se necessário para respeitar rate limit"""
+        async with self._lock:
+            now = datetime.now()
+            # Remove chamadas antigas (> 1 minuto)
+            self.calls = [call for call in self.calls if now - call < timedelta(minutes=1)]
+            
+            if len(self.calls) >= self.max_per_minute:
+                # Calcula tempo de espera
+                oldest_call = min(self.calls)
+                wait_time = 60 - (now - oldest_call).total_seconds()
+                if wait_time > 0:
+                    logger.warning(f"⏳ Rate limit atingido. Aguardando {wait_time:.1f}s...")
+                    await asyncio.sleep(wait_time)
+                    # Limpa lista após esperar
+                    self.calls = []
+            
+            # Registra nova chamada
+            self.calls.append(now)
 
-# Configurações de cache
-CACHE_CONFIG = {
-    "l1_size": 1000,
-    "l2_ttl_days": 7,
-    "l3_ttl_days": 30,
-    "cache_compression": True
-}
-
-# Configurações de scraping
-SCRAPING_CONFIG = {
-    "timeout": 30,
-    "max_retries": 3,
-    "user_agents": [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    ],
-    "rate_limit_delay": 1
-}
-
-# ===================================================================================
-# CLASSE: APIManager
-# ===================================================================================
 
 class APIManager:
-    """Gerenciador centralizado de APIs e chaves"""
+    """Gerencia todas as APIs externas do sistema"""
     
     def __init__(self):
-        self.api_keys = {}
-        self.clients = {}
+        self.apis = {}
         self.rate_limiters = {}
-        self._load_api_keys()
-        self._initialize_clients()
-    
-    def _load_api_keys(self):
-        """Carrega API keys do Colab ou variáveis de ambiente"""
-        try:
-            from google.colab import userdata
+        self.session = None
+        self.is_initialized = False
+        
+    async def initialize(self):
+        """Inicializa todas as APIs configuradas"""
+        if self.is_initialized:
+            return
             
-            # Lista de chaves necessárias
-            required_keys = [
-                'GEMINI_API_KEY',
-                'ANTHROPIC_API_KEY', 
-                'OPENAI_API_KEY',
-                'DEEPSEEK_API_KEY',
-                'GOOGLE_MAPS_API_KEY',
-                'APIFY_API_KEY',
-                'APIFY_API_KEY_LINKTREE',
-                'GOOGLE_CSE_ID',
-                'GOOGLE_CSE_API_KEY'
-            ]
-            
-            # Tenta carregar do Colab userdata
-            for key in required_keys:
-                try:
-                    self.api_keys[key] = userdata.get(key)
-                except:
-                    # Fallback para variável de ambiente
-                    self.api_keys[key] = os.environ.get(key, '')
-                    
-        except ImportError:
-            # Não está no Colab, usar variáveis de ambiente
-            self.api_keys = {
-                'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY', ''),
-                'ANTHROPIC_API_KEY': os.environ.get('ANTHROPIC_API_KEY', ''),
-                'OPENAI_API_KEY': os.environ.get('OPENAI_API_KEY', ''),
-                'DEEPSEEK_API_KEY': os.environ.get('DEEPSEEK_API_KEY', ''),
-                'GOOGLE_MAPS_API_KEY': os.environ.get('GOOGLE_MAPS_API_KEY', ''),
-                'APIFY_API_KEY': os.environ.get('APIFY_API_KEY', ''),
-                'APIFY_API_KEY_LINKTREE': os.environ.get('APIFY_API_KEY_LINKTREE', ''),
-                'GOOGLE_CSE_ID': os.environ.get('GOOGLE_CSE_ID', ''),
-                'GOOGLE_CSE_API_KEY': os.environ.get('GOOGLE_CSE_API_KEY', '')
-            }
-    
-    def _initialize_clients(self):
-        """Inicializa clientes das APIs"""
-        # Google Generative AI
-        if self.api_keys.get('GEMINI_API_KEY'):
-            try:
-                import google.generativeai as genai
-                genai.configure(api_key=self.api_keys['GEMINI_API_KEY'])
-                self.clients['gemini'] = genai
-                logging.info("✅ Gemini API configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar Gemini: {e}")
+        logger.info("🚀 Inicializando APIs...")
         
-        # Anthropic
-        if self.api_keys.get('ANTHROPIC_API_KEY'):
-            try:
-                import anthropic
-                self.clients['anthropic'] = anthropic.Anthropic(
-                    api_key=self.api_keys['ANTHROPIC_API_KEY']
-                )
-                logging.info("✅ Anthropic API configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar Anthropic: {e}")
-        
-        # OpenAI
-        if self.api_keys.get('OPENAI_API_KEY'):
-            try:
-                import openai
-                openai.api_key = self.api_keys['OPENAI_API_KEY']
-                self.clients['openai'] = openai
-                logging.info("✅ OpenAI API configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar OpenAI: {e}")
-        
-        # DeepSeek
-        if self.api_keys.get('DEEPSEEK_API_KEY'):
-            try:
-                # DeepSeek usa API compatível com OpenAI
-                from openai import OpenAI
-                self.clients['deepseek'] = OpenAI(
-                    api_key=self.api_keys['DEEPSEEK_API_KEY'],
-                    base_url="https://api.deepseek.com/v1"
-                )
-                logging.info("✅ DeepSeek API configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar DeepSeek: {e}")
+        # Criar sessão aiohttp
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={'User-Agent': 'AURA-NEXUS/1.0'}
+        )
         
         # Google Maps
-        if self.api_keys.get('GOOGLE_MAPS_API_KEY'):
-            try:
-                import googlemaps
-                self.clients['googlemaps'] = googlemaps.Client(
-                    key=self.api_keys['GOOGLE_MAPS_API_KEY']
-                )
-                logging.info("✅ Google Maps API configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar Google Maps: {e}")
-        
-        # Apify - Cliente Principal
-        if self.api_keys.get('APIFY_API_KEY'):
-            try:
-                from apify_client import ApifyClient
-                self.clients['apify_main'] = ApifyClient(self.api_keys['APIFY_API_KEY'])
-                logging.info("✅ Apify API principal configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar Apify principal: {e}")
-        
-        # Apify - Cliente Linktree
-        if self.api_keys.get('APIFY_API_KEY_LINKTREE'):
-            try:
-                from apify_client import ApifyClient
-                self.clients['apify_linktree'] = ApifyClient(self.api_keys['APIFY_API_KEY_LINKTREE'])
-                logging.info("✅ Apify API Linktree configurada")
-            except Exception as e:
-                logging.error(f"❌ Erro ao configurar Apify Linktree: {e}")
-    
-    def get_api_key(self, key_name: str) -> str:
-        """Retorna uma API key específica"""
-        return self.api_keys.get(key_name, '')
-    
-    def get_client(self, client_name: str) -> Any:
-        """Retorna um cliente de API específico"""
-        return self.clients.get(client_name)
-    
-    def validate_apis(self) -> Dict[str, bool]:
-        """Valida quais APIs estão disponíveis"""
-        validation = {}
-        
-        for key_name, key_value in self.api_keys.items():
-            validation[key_name] = bool(key_value)
-        
-        return validation
-
-# ===================================================================================
-# CLASSE: MultiLLMConfig
-# ===================================================================================
-
-class MultiLLMConfig:
-    """Configuração para múltiplos LLMs"""
-    
-    def __init__(self, api_manager: APIManager):
-        self.api_manager = api_manager
-        self.llm_configs = {}
-        self.active_llms = []
-        self._setup_llm_configs()
-    
-    def _setup_llm_configs(self):
-        """Configura os LLMs disponíveis"""
-        # Gemini
-        if self.api_manager.get_api_key('GEMINI_API_KEY'):
-            self.llm_configs['gemini'] = {
-                'type': 'gemini',
-                'client': self.api_manager.get_client('gemini'),
-                'config': LLM_CONFIG['gemini'],
-                'weight': 0.4
-            }
-            self.active_llms.append('gemini')
-        
-        # Claude
-        if self.api_manager.get_api_key('ANTHROPIC_API_KEY'):
-            self.llm_configs['claude'] = {
-                'type': 'claude',
-                'client': self.api_manager.get_client('anthropic'),
-                'config': LLM_CONFIG['claude'],
-                'weight': 0.3
-            }
-            self.active_llms.append('claude')
+        if os.getenv('GOOGLE_MAPS_API_KEY'):
+            self.apis['google_maps'] = googlemaps.Client(
+                key=os.getenv('GOOGLE_MAPS_API_KEY')
+            )
+            self.rate_limiters['google_maps'] = RateLimiter(
+                int(os.getenv('GOOGLE_MAPS_RPM', 60))
+            )
+            logger.info("✅ Google Maps API configurada")
         
         # OpenAI
-        if self.api_manager.get_api_key('OPENAI_API_KEY'):
-            self.llm_configs['openai'] = {
-                'type': 'openai',
-                'client': self.api_manager.get_client('openai'),
-                'config': LLM_CONFIG['openai'],
-                'weight': 0.2
-            }
-            self.active_llms.append('openai')
+        if os.getenv('OPENAI_API_KEY'):
+            openai.api_key = os.getenv('OPENAI_API_KEY')
+            self.apis['openai'] = openai
+            self.rate_limiters['openai'] = RateLimiter(
+                int(os.getenv('OPENAI_RPM', 50))
+            )
+            logger.info("✅ OpenAI API configurada")
         
+        # Anthropic Claude
+        if os.getenv('ANTHROPIC_API_KEY'):
+            self.apis['anthropic'] = Anthropic(
+                api_key=os.getenv('ANTHROPIC_API_KEY')
+            )
+            self.rate_limiters['anthropic'] = RateLimiter(
+                int(os.getenv('ANTHROPIC_RPM', 40))
+            )
+            logger.info("✅ Anthropic API configurada")
+        
+        # Google Gemini
+        if os.getenv('GOOGLE_AI_API_KEY'):
+            genai.configure(api_key=os.getenv('GOOGLE_AI_API_KEY'))
+            self.apis['gemini'] = genai
+            self.rate_limiters['gemini'] = RateLimiter(50)
+            logger.info("✅ Google Gemini API configurada")
+            
         # DeepSeek
-        if self.api_manager.get_api_key('DEEPSEEK_API_KEY'):
-            self.llm_configs['deepseek'] = {
-                'type': 'deepseek',
-                'client': self.api_manager.get_client('deepseek'),
-                'config': LLM_CONFIG['deepseek'],
-                'weight': 0.2
+        if os.getenv('DEEPSEEK_API_KEY'):
+            self.apis['deepseek'] = {
+                'api_key': os.getenv('DEEPSEEK_API_KEY'),
+                'base_url': 'https://api.deepseek.com/v1'
             }
-            self.active_llms.append('deepseek')
+            self.rate_limiters['deepseek'] = RateLimiter(60)
+            logger.info("✅ DeepSeek API configurada")
         
-        # Normalizar pesos
-        if self.active_llms:
-            total_weight = sum(self.llm_configs[llm]['weight'] for llm in self.active_llms)
-            for llm in self.active_llms:
-                self.llm_configs[llm]['weight'] /= total_weight
+        # Google Custom Search
+        if os.getenv('GOOGLE_CSE_API_KEY') and os.getenv('GOOGLE_CSE_CX'):
+            self.apis['google_cse'] = {
+                'api_key': os.getenv('GOOGLE_CSE_API_KEY'),
+                'cx': os.getenv('GOOGLE_CSE_CX')
+            }
+            self.rate_limiters['google_cse'] = RateLimiter(
+                int(os.getenv('GOOGLE_CSE_RPM', 100))
+            )
+            logger.info("✅ Google Custom Search API configurada")
         
-        logging.info(f"✅ LLMs ativos: {self.active_llms}")
-    
-    def get_llm_config(self, llm_name: str) -> Dict[str, Any]:
-        """Retorna configuração de um LLM específico"""
-        return self.llm_configs.get(llm_name, {})
-    
-    def get_active_llms(self) -> List[str]:
-        """Retorna lista de LLMs ativos"""
-        return self.active_llms
-    
-    def get_weights(self) -> Dict[str, float]:
-        """Retorna pesos dos LLMs"""
-        return {llm: self.llm_configs[llm]['weight'] for llm in self.active_llms}
-
-# ===================================================================================
-# CLASSE: StandardizedScoringSystem
-# ===================================================================================
-
-@dataclass
-class ScoringCriteria:
-    """Critério de pontuação"""
-    name: str
-    weight: float
-    min_value: float = 0.0
-    max_value: float = 100.0
-
-class StandardizedScoringSystem:
-    """Sistema de pontuação padronizado para leads"""
-    
-    def __init__(self):
-        self.criteria = self._setup_scoring_criteria()
-        self.score_ranges = self._setup_score_ranges()
-    
-    def _setup_scoring_criteria(self) -> List[ScoringCriteria]:
-        """Define critérios de pontuação"""
-        return [
-            ScoringCriteria("completude_dados", 0.20),
-            ScoringCriteria("relevancia_conteudo", 0.25),
-            ScoringCriteria("presenca_digital", 0.15),
-            ScoringCriteria("engagement_reviews", 0.15),
-            ScoringCriteria("informacoes_contato", 0.15),
-            ScoringCriteria("potencial_negocio", 0.10)
-        ]
-    
-    def _setup_score_ranges(self) -> Dict[str, tuple]:
-        """Define faixas de pontuação"""
-        return {
-            "excelente": (85, 100),
-            "muito_bom": (70, 84),
-            "bom": (55, 69),
-            "regular": (40, 54),
-            "fraco": (0, 39)
-        }
-    
-    def calculate_score(self, lead_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Calcula score final do lead"""
-        scores = {}
+        # Apify
+        if os.getenv('APIFY_API_TOKEN'):
+            try:
+                from apify_client import ApifyClient
+                
+                # Create main Apify client
+                apify_client = ApifyClient(os.getenv('APIFY_API_TOKEN'))
+                
+                self.apis['apify'] = {
+                    'client': apify_client,
+                    'token': os.getenv('APIFY_API_TOKEN'),
+                    'instagram_actor': os.getenv('APIFY_INSTAGRAM_ACTOR_ID', 'apify/instagram-profile-scraper'),
+                    'facebook_actor': os.getenv('APIFY_FACEBOOK_ACTOR_ID', 'curious_coder/facebook-profile-scraper'),
+                    'linkedin_actor': os.getenv('APIFY_LINKEDIN_ACTOR_ID', 'apify/linkedin-profile-scraper')
+                }
+                self.rate_limiters['apify'] = RateLimiter(30)
+                logger.info("✅ Apify API configurada com cliente")
+            except ImportError:
+                logger.warning("⚠️ apify-client não encontrado. Instale com: pip install apify-client")
+                self.apis['apify'] = {
+                    'token': os.getenv('APIFY_API_TOKEN'),
+                    'instagram_actor': os.getenv('APIFY_INSTAGRAM_ACTOR_ID', 'apify/instagram-profile-scraper'),
+                    'facebook_actor': os.getenv('APIFY_FACEBOOK_ACTOR_ID', 'curious_coder/facebook-profile-scraper'),
+                    'client': None
+                }
+                self.rate_limiters['apify'] = RateLimiter(30)
+                logger.info("✅ Apify API configurada (sem cliente)")
         
-        # Completude dos dados
-        scores['completude_dados'] = self._score_data_completeness(lead_data)
-        
-        # Relevância do conteúdo
-        scores['relevancia_conteudo'] = lead_data.get('content_relevance_score', 0)
-        
-        # Presença digital
-        scores['presenca_digital'] = self._score_digital_presence(lead_data)
-        
-        # Engagement de reviews
-        scores['engagement_reviews'] = self._score_review_engagement(lead_data)
-        
-        # Informações de contato
-        scores['informacoes_contato'] = self._score_contact_info(lead_data)
-        
-        # Potencial de negócio
-        scores['potencial_negocio'] = self._score_business_potential(lead_data)
-        
-        # Calcular score final ponderado
-        final_score = 0
-        for criteria in self.criteria:
-            score = scores.get(criteria.name, 0)
-            final_score += score * criteria.weight
-        
-        # Determinar categoria
-        category = self._get_score_category(final_score)
-        
-        return {
-            'final_score': round(final_score, 2),
-            'category': category,
-            'detailed_scores': scores,
-            'timestamp': datetime.now().isoformat()
-        }
+        self.is_initialized = True
+        logger.info(f"✅ {len(self.apis)} APIs inicializadas com sucesso!")
     
-    def _score_data_completeness(self, lead_data: Dict) -> float:
-        """Pontua completude dos dados"""
-        required_fields = [
-            'nome_empresa', 'endereco', 'cidade', 'estado',
-            'telefone', 'website', 'email', 'horario_funcionamento'
-        ]
+    async def close(self):
+        """Fecha conexões abertas"""
+        if self.session:
+            await self.session.close()
+    
+    def get_api(self, api_name: str) -> Any:
+        """Retorna cliente da API solicitada"""
+        if api_name not in self.apis:
+            raise ValueError(f"API '{api_name}' não configurada")
+        return self.apis[api_name]
+    
+    def get_client(self, client_name: str) -> Any:
+        """Retorna cliente específico (para compatibilidade com SocialMediaScraper)"""
+        if client_name == 'apify_main' and 'apify' in self.apis:
+            return self.apis['apify'].get('client')
+        elif client_name == 'apify_linktree' and 'apify' in self.apis:
+            return self.apis['apify'].get('client')  # Use same client for now
+        return None
+    
+    async def call_with_rate_limit(self, api_name: str, func, *args, **kwargs):
+        """Executa chamada respeitando rate limit"""
+        if api_name not in self.rate_limiters:
+            # Se não tem rate limiter, executa direto
+            return await self._execute_async(func, *args, **kwargs)
         
-        filled_fields = sum(1 for field in required_fields if lead_data.get(field))
-        return (filled_fields / len(required_fields)) * 100
-    
-    def _score_digital_presence(self, lead_data: Dict) -> float:
-        """Pontua presença digital"""
-        score = 0
+        # Espera se necessário
+        await self.rate_limiters[api_name].wait_if_needed()
         
-        if lead_data.get('website'): score += 25
-        if lead_data.get('facebook'): score += 20
-        if lead_data.get('instagram'): score += 20
-        if lead_data.get('whatsapp'): score += 20
-        if lead_data.get('reviews_count', 0) > 10: score += 15
+        # Executa
+        return await self._execute_async(func, *args, **kwargs)
+    
+    async def _execute_async(self, func, *args, **kwargs):
+        """Executa função de forma assíncrona"""
+        # Se a função já é assíncrona
+        if asyncio.iscoroutinefunction(func):
+            return await func(*args, **kwargs)
         
-        return min(score, 100)
+        # Se é síncrona, executa em thread pool
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, func, *args, **kwargs)
     
-    def _score_review_engagement(self, lead_data: Dict) -> float:
-        """Pontua engajamento em reviews"""
-        reviews_count = lead_data.get('reviews_count', 0)
-        rating = lead_data.get('rating', 0)
+    # === APIs Específicas ===
+    
+    async def search_place_google_maps(self, query: str, location: str = None) -> Optional[Dict]:
+        """Busca lugar no Google Maps"""
+        if 'google_maps' not in self.apis:
+            logger.warning("⚠️ Google Maps API não configurada")
+            return None
         
-        if reviews_count == 0:
-            return 0
-        
-        # Fórmula: (rating/5 * 50) + (min(reviews_count, 100)/100 * 50)
-        rating_score = (rating / 5) * 50
-        count_score = (min(reviews_count, 100) / 100) * 50
-        
-        return rating_score + count_score
-    
-    def _score_contact_info(self, lead_data: Dict) -> float:
-        """Pontua informações de contato"""
-        score = 0
-        
-        if lead_data.get('telefone'): score += 30
-        if lead_data.get('whatsapp'): score += 30
-        if lead_data.get('email'): score += 20
-        if lead_data.get('contato_responsavel'): score += 20
-        
-        return score
-    
-    def _score_business_potential(self, lead_data: Dict) -> float:
-        """Pontua potencial de negócio"""
-        # Baseado em análise de IA
-        return lead_data.get('ai_business_potential_score', 50)
-    
-    def _get_score_category(self, score: float) -> str:
-        """Retorna categoria baseada no score"""
-        for category, (min_score, max_score) in self.score_ranges.items():
-            if min_score <= score <= max_score:
-                return category
-        return "indefinido"
-
-# ===================================================================================
-# FUNÇÕES UTILITÁRIAS
-# ===================================================================================
-
-def create_directories():
-    """Cria estrutura de diretórios necessária"""
-    directories = [OUTPUT_DIR, CACHE_DIR, CHECKPOINT_DIR, LOGS_DIR, DATA_DIR]
-    
-    for directory in directories:
-        directory.mkdir(parents=True, exist_ok=True)
-    
-    # Criar subdiretórios
-    (OUTPUT_DIR / "enriched").mkdir(exist_ok=True)
-    (OUTPUT_DIR / "reports").mkdir(exist_ok=True)
-    (CACHE_DIR / "l1_memory").mkdir(exist_ok=True)
-    (CACHE_DIR / "l2_file").mkdir(exist_ok=True)
-    (CACHE_DIR / "l3_persistent").mkdir(exist_ok=True)
-    
-    logging.info("✅ Estrutura de diretórios criada")
-
-def setup_logging(log_level=logging.INFO):
-    """Configura sistema de logging"""
-    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    
-    # Criar logger
-    logger = logging.getLogger("AURA_NEXUS")
-    logger.setLevel(log_level)
-    
-    # Handler para arquivo
-    log_file = LOGS_DIR / f"aura_nexus_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(logging.Formatter(log_format))
-    
-    # Handler para console
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(log_format))
-    
-    # Adicionar handlers
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    return logger
-
-def validate_environment() -> Dict[str, bool]:
-    """Valida o ambiente de execução"""
-    validation = {
-        "google_colab": False,
-        "google_drive": False,
-        "gpu_available": False,
-        "apis_configured": False
-    }
-    
-    # Verificar Google Colab
-    try:
-        import google.colab
-        validation["google_colab"] = True
-    except:
-        pass
-    
-    # Verificar Google Drive
-    if validation["google_colab"]:
         try:
-            from google.colab import drive
-            validation["google_drive"] = os.path.exists("/content/drive")
-        except:
-            pass
+            gmaps = self.apis['google_maps']
+            
+            # Buscar lugar
+            result = await self.call_with_rate_limit(
+                'google_maps',
+                lambda: gmaps.places(
+                    query=query,
+                    language='pt-BR',
+                    region='br'
+                )
+            )
+            
+            if result['results']:
+                return result['results'][0]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar no Google Maps: {e}")
+            return None
     
-    # Verificar GPU
-    try:
-        import torch
-        validation["gpu_available"] = torch.cuda.is_available()
-    except:
-        pass
+    async def get_place_details(self, place_id: str) -> Optional[Dict]:
+        """Obtém detalhes de um lugar do Google Maps"""
+        if 'google_maps' not in self.apis:
+            return None
+        
+        try:
+            gmaps = self.apis['google_maps']
+            
+            result = await self.call_with_rate_limit(
+                'google_maps',
+                lambda: gmaps.place(
+                    place_id=place_id,
+                    language='pt-BR',
+                    fields=[
+                        'name', 'formatted_address', 'formatted_phone_number',
+                        'website', 'rating', 'user_ratings_total', 'opening_hours',
+                        'photo', 'type', 'geometry', 'business_status'
+                    ]
+                )
+            )
+            
+            return result.get('result')
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao obter detalhes do lugar: {e}")
+            return None
     
-    # Verificar APIs
-    api_manager = APIManager()
-    api_validation = api_manager.validate_apis()
-    validation["apis_configured"] = any(api_validation.values())
+    async def search_google_cse(self, query: str, num: int = 10) -> List[Dict]:
+        """Busca usando Google Custom Search"""
+        if 'google_cse' not in self.apis:
+            logger.warning("⚠️ Google CSE não configurado")
+            return []
+        
+        try:
+            cse = self.apis['google_cse']
+            url = "https://www.googleapis.com/customsearch/v1"
+            
+            params = {
+                'key': cse['api_key'],
+                'cx': cse['cx'],
+                'q': query,
+                'num': num,
+                'hl': 'pt-BR',
+                'gl': 'br'
+            }
+            
+            # Rate limit
+            await self.rate_limiters['google_cse'].wait_if_needed()
+            
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('items', [])
+                else:
+                    logger.error(f"❌ Google CSE erro: {response.status}")
+                    return []
+                    
+        except Exception as e:
+            logger.error(f"❌ Erro no Google CSE: {e}")
+            return []
     
-    return validation
-
-# ===================================================================================
-# CONFIGURAÇÃO INICIAL
-# ===================================================================================
-
-def initialize_system():
-    """Inicializa o sistema AURA NEXUS"""
-    print("🚀 Inicializando AURA NEXUS v24.4...")
+    async def complete_openai(self, prompt: str, model: str = "gpt-3.5-turbo", **kwargs) -> Optional[str]:
+        """Gera texto usando OpenAI"""
+        if 'openai' not in self.apis:
+            return None
+        
+        try:
+            await self.rate_limiters['openai'].wait_if_needed()
+            
+            # Criar cliente OpenAI
+            from openai import OpenAI
+            client = OpenAI(api_key=openai.api_key)
+            
+            # Executar chamada
+            completion = await self._execute_async(
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    **kwargs
+                )
+            )
+            
+            return completion.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"❌ Erro OpenAI: {e}")
+            return None
     
-    # Criar diretórios
-    create_directories()
+    async def complete_anthropic(self, prompt: str, model: str = "claude-3-haiku-20240307", **kwargs) -> Optional[str]:
+        """Gera texto usando Anthropic Claude"""
+        if 'anthropic' not in self.apis:
+            return None
+        
+        try:
+            await self.rate_limiters['anthropic'].wait_if_needed()
+            
+            client = self.apis['anthropic']
+            response = await self._execute_async(
+                client.messages.create,
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+                **kwargs
+            )
+            
+            return response.content[0].text
+            
+        except Exception as e:
+            logger.error(f"❌ Erro Anthropic: {e}")
+            return None
     
-    # Configurar logging
-    logger = setup_logging()
+    async def complete_gemini(self, prompt: str, model_name: str = "gemini-pro", **kwargs) -> Optional[str]:
+        """Gera texto usando Google Gemini"""
+        if 'gemini' not in self.apis:
+            return None
+        
+        try:
+            await self.rate_limiters['gemini'].wait_if_needed()
+            
+            model = genai.GenerativeModel(model_name)
+            response = await self._execute_async(
+                model.generate_content,
+                prompt
+            )
+            
+            return response.text
+            
+        except Exception as e:
+            logger.error(f"❌ Erro Gemini: {e}")
+            return None
+            
+    async def complete_deepseek(self, prompt: str, model: str = "deepseek-chat", **kwargs) -> Optional[str]:
+        """Gera texto usando DeepSeek"""
+        if 'deepseek' not in self.apis:
+            return None
+        
+        try:
+            await self.rate_limiters['deepseek'].wait_if_needed()
+            
+            deepseek_config = self.apis['deepseek']
+            
+            # Use OpenAI client with DeepSeek endpoint
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=deepseek_config['api_key'],
+                base_url=deepseek_config['base_url']
+            )
+            
+            completion = await self._execute_async(
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    **kwargs
+                )
+            )
+            
+            return completion.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"❌ Erro DeepSeek: {e}")
+            return None
     
-    # Validar ambiente
-    env_validation = validate_environment()
-    logger.info(f"Validação do ambiente: {env_validation}")
+    def get_available_apis(self) -> List[str]:
+        """Retorna lista de APIs disponíveis"""
+        return list(self.apis.keys())
     
-    # Inicializar API Manager
-    api_manager = APIManager()
-    api_validation = api_manager.validate_apis()
+    def get_api_status(self) -> Dict[str, Any]:
+        """Retorna status das APIs"""
+        status = {
+            'initialized': self.is_initialized,
+            'available_apis': self.get_available_apis(),
+            'rate_limits': {}
+        }
+        
+        for api_name, limiter in self.rate_limiters.items():
+            status['rate_limits'][api_name] = {
+                'max_per_minute': limiter.max_per_minute,
+                'current_calls': len(limiter.calls)
+            }
+        
+        return status
     
-    # Mostrar status das APIs
-    print("\n📊 Status das APIs:")
-    for api, is_configured in api_validation.items():
-        status = "✅" if is_configured else "❌"
-        print(f"{status} {api}")
-    
-    # Inicializar configurações de LLM
-    llm_config = MultiLLMConfig(api_manager)
-    
-    # Inicializar sistema de scoring
-    scoring_system = StandardizedScoringSystem()
-    
-    print("\n✅ Sistema inicializado com sucesso!")
-    
-    return {
-        'api_manager': api_manager,
-        'llm_config': llm_config,
-        'scoring_system': scoring_system,
-        'logger': logger
-    }
-
-# ===================================================================================
-# EXEMPLO DE USO
-# ===================================================================================
-
-if __name__ == "__main__":
-    # Inicializar sistema
-    system = initialize_system()
-    
-    # Exemplo de uso do scoring system
-    exemplo_lead = {
-        'nome_empresa': 'Empresa Teste',
-        'endereco': 'Rua Teste, 123',
-        'cidade': 'São Paulo',
-        'estado': 'SP',
-        'telefone': '11999999999',
-        'website': 'www.teste.com',
-        'whatsapp': '11999999999',
-        'rating': 4.5,
-        'reviews_count': 50,
-        'content_relevance_score': 85
-    }
-    
-    score_result = system['scoring_system'].calculate_score(exemplo_lead)
-    print(f"\n📊 Score do lead exemplo: {score_result['final_score']} ({score_result['category']})")
+    async def scrape_with_apify(self, actor_id: str, run_input: Dict[str, Any], timeout: int = 120) -> Optional[List[Dict]]:
+        """Executa scraping usando Apify Actor"""
+        if 'apify' not in self.apis or not self.apis['apify'].get('client'):
+            logger.warning("⚠️ Cliente Apify não disponível")
+            return None
+        
+        try:
+            await self.rate_limiters['apify'].wait_if_needed()
+            
+            client = self.apis['apify']['client']
+            
+            # Execute actor
+            run = await self._execute_async(
+                client.actor(actor_id).call,
+                run_input=run_input,
+                timeout_secs=timeout
+            )
+            
+            # Get results
+            items = await self._execute_async(
+                lambda: list(client.dataset(run["defaultDatasetId"]).iterate_items())
+            )
+            
+            logger.info(f"✅ Apify scraping completado: {len(items)} itens")
+            return items
+            
+        except Exception as e:
+            logger.error(f"❌ Erro no scraping Apify: {e}")
+            return None

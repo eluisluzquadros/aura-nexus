@@ -20,10 +20,13 @@ python-dotenv>=1.0.0
 validators>=0.20.0
 phonenumbers>=8.13.0
 nest-asyncio>=1.5.6
+colorama>=0.4.6
 
-# ML
+# ML & Statistics
 scikit-learn>=1.0.0
 tiktoken>=0.5.0
+numpy>=1.19.0
+scipy>=1.7.0
 
 # Dev
 pytest>=7.0.0

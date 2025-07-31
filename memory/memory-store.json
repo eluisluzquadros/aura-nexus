@@ -1,0 +1,10 @@
+{
+  "default": [
+    {
+      "key": "setup/initial",
+      "value": "{\"project\": \"aura-nexus\", \"initialized\": true, \"topology\": \"mesh\", \"agents\": 6}",
+      "namespace": "default",
+      "timestamp": 1753926650813
+    }
+  ]
+}

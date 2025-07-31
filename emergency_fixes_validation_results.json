@@ -1,0 +1,67 @@
+{
+  "timestamp": "2025-07-31T02:57:10.734699",
+  "tests": {
+    "Multi-LLM Consensus": {
+      "passed": true,
+      "available_llms": 2,
+      "consensus_working": true,
+      "analysis_generated": true,
+      "performance": {
+        "processing_time": 22.07970404624939
+      },
+      "errors": []
+    },
+    "Contact Quality": {
+      "passed": false,
+      "phone_validation_working": false,
+      "email_validation_working": false,
+      "fake_detection_working": false,
+      "validation_rate": 0.0,
+      "errors": [
+        "'LeadProcessor' object has no attribute '_clean_phone_number'"
+      ]
+    },
+    "Social Scraping": {
+      "passed": false,
+      "platforms_supported": 0,
+      "fields_extracted": 0,
+      "expected_fields_found": 0,
+      "apify_available": false,
+      "fallback_working": false,
+      "errors": [
+        "'LeadProcessor' object has no attribute '_enrich_social_scraping'"
+      ]
+    },
+    "Performance Metrics": {
+      "passed": false,
+      "processing_time_per_lead": 0.0,
+      "memory_usage_mb": 0.0,
+      "api_calls_count": 0,
+      "error_rate": 0.0,
+      "meets_performance_targets": false,
+      "errors": [
+        "LeadProcessor.process_lead() got an unexpected keyword argument 'features'"
+      ]
+    },
+    "Business Requirements": {
+      "passed": false,
+      "premium_columns": 0,
+      "basic_columns": 0,
+      "contact_validation_rate": 0.0,
+      "social_platforms_working": 0,
+      "feature_integration_working": false,
+      "errors": [
+        "LeadProcessor.process_lead() got an unexpected keyword argument 'features'"
+      ]
+    }
+  },
+  "performance_metrics": {},
+  "business_validation": {},
+  "summary": {
+    "total_tests": 5,
+    "passed_tests": 1,
+    "success_rate": 0.2,
+    "all_fixes_working": false,
+    "timestamp": "2025-07-31T02:58:20.982143"
+  }
+}

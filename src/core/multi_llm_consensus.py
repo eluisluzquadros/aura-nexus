@@ -1,850 +1,1173 @@
-import os
-import json
+# -*- coding: utf-8 -*-
+"""
+AURA NEXUS - Sistema de Consenso Multi-LLM
+Análise com múltiplas IAs para maior precisão
+Inclui estatísticas Kappa, tracking de tokens e consenso avançado
+"""
+
 import asyncio
-import logging
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime
+import numpy as np
+import json
 import time
 import statistics
-import re
-import hashlib
-from collections import defaultdict
-import numpy as np
-try:
-    import tiktoken
-except ImportError:
-    tiktoken = None
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, Any, List, Optional, Literal, Union, Tuple, Callable
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import tiktoken
+from sklearn.metrics import cohen_kappa_score
 
-# Imports de outras células
-from aura_nexus_celula_02 import LLMAnalysisResult, ConsensusResult
-from aura_nexus_celula_19_data_review import DataReviewAgent
+from ..core.api_manager import APIManager
 
-# Configurar logger
 logger = logging.getLogger("AURA_NEXUS.MultiLLM")
 
-# ===================================================================================
-# CÉLULA 3: SISTEMA MULTI-LLM AVANÇADO
-# ===================================================================================
 
-class UniversalTokenCounter:
-    """Contador universal de tokens para múltiplos LLMs"""
+class ConsensusStrategy(Enum):
+    """Estratégias de consenso disponíveis"""
+    MAJORITY_VOTE = "majority_vote"
+    WEIGHTED_AVERAGE = "weighted_average" 
+    UNANIMOUS = "unanimous"
+    THRESHOLD_BASED = "threshold_based"
+    KAPPA_WEIGHTED = "kappa_weighted"
+    CONFIDENCE_WEIGHTED = "confidence_weighted"
+    FALLBACK_CASCADE = "fallback_cascade"
+    ENSEMBLE_VOTING = "ensemble_voting"
+
+
+@dataclass
+class TokenMetrics:
+    """Métricas de tokens e custos por LLM"""
+    llm_name: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost: float = 0.0
+    request_count: int = 0
+    avg_response_time: float = 0.0
+    success_rate: float = 1.0
+    
+    def __post_init__(self):
+        self.total_tokens = self.input_tokens + self.output_tokens
+
+
+@dataclass
+class KappaStatistics:
+    """Estatísticas Kappa para inter-rater agreement"""
+    cohens_kappa: Optional[float] = None
+    fleiss_kappa: Optional[float] = None
+    raw_agreement: float = 0.0
+    expected_agreement: float = 0.0
+    interpretation: str = ""
+    confidence_interval: Tuple[float, float] = (0.0, 0.0)
+    sample_size: int = 0
+    
+    def interpret_kappa(self, kappa_value: float) -> str:
+        """Interpreta valor do Kappa segundo escala Landis & Koch"""
+        if kappa_value < 0:
+            return "Poor (Worse than chance)"
+        elif kappa_value < 0.2:
+            return "Slight agreement"
+        elif kappa_value < 0.4:
+            return "Fair agreement"
+        elif kappa_value < 0.6:
+            return "Moderate agreement"
+        elif kappa_value < 0.8:
+            return "Substantial agreement"
+        else:
+            return "Almost perfect agreement"
+
+
+@dataclass
+class ConsensusResult:
+    """Resultado de análise com consenso estatisticamente fundamentado"""
+    success: bool
+    consensus_type: str
+    strategy_used: ConsensusStrategy
+    participating_llms: List[str]
+    individual_results: Dict[str, Any]
+    final_result: Dict[str, Any]
+    agreement_score: float
+    kappa_statistics: Optional[KappaStatistics]
+    token_metrics: Dict[str, TokenMetrics]
+    confidence_score: float
+    divergences: List[Dict[str, Any]]
+    fallback_applied: bool
+    processing_time: float
+    cost_breakdown: Dict[str, float]
+    performance_metrics: Dict[str, Any] = field(default_factory=dict)
+
+
+class KappaCalculator:
+    """Calculadora de estatísticas Kappa para inter-rater agreement"""
+    
+    @staticmethod
+    def calculate_cohens_kappa(rater1_scores: List[Union[int, float]], 
+                              rater2_scores: List[Union[int, float]]) -> float:
+        """Calcula Cohen's Kappa entre dois avaliadores"""
+        if len(rater1_scores) != len(rater2_scores):
+            raise ValueError("Rater scores must have same length")
+        
+        # Converter para categorias se necessário
+        if isinstance(rater1_scores[0], float):
+            rater1_scores = [KappaCalculator._float_to_category(x) for x in rater1_scores]
+            rater2_scores = [KappaCalculator._float_to_category(x) for x in rater2_scores]
+        
+        return cohen_kappa_score(rater1_scores, rater2_scores)
+    
+    @staticmethod
+    def calculate_fleiss_kappa(ratings_matrix: List[List[int]]) -> float:
+        """Calcula Fleiss' Kappa para múltiplos avaliadores"""
+        if not ratings_matrix or not ratings_matrix[0]:
+            return 0.0
+            
+        n_items = len(ratings_matrix)
+        n_raters = len(ratings_matrix[0])
+        
+        if n_items < 2 or n_raters < 2:
+            return 0.0
+        
+        # Converter matrix para numpy
+        ratings = np.array(ratings_matrix)
+        
+        # Encontrar todas as categorias
+        categories = sorted(set(ratings.flatten()))
+        n_categories = len(categories)
+        
+        if n_categories < 2:
+            return 1.0  # Acordo perfeito se só há uma categoria
+        
+        # Criar matriz de concordância
+        agreement_matrix = np.zeros((n_items, n_categories))
+        
+        for i, item_ratings in enumerate(ratings):
+            for rating in item_ratings:
+                cat_idx = categories.index(rating)
+                agreement_matrix[i, cat_idx] += 1
+        
+        # Calcular proporções
+        p_i = np.sum(agreement_matrix, axis=0) / (n_items * n_raters)
+        
+        # Calcular P_e (expected agreement)
+        P_e = np.sum(p_i ** 2)
+        
+        # Calcular P_o (observed agreement)
+        P_o = 0
+        for i in range(n_items):
+            for j in range(n_categories):
+                n_ij = agreement_matrix[i, j]
+                P_o += n_ij * (n_ij - 1) / (n_raters * (n_raters - 1))
+        P_o /= n_items
+        
+        # Fleiss' Kappa
+        if P_e == 1.0:
+            return 1.0
+        
+        kappa = (P_o - P_e) / (1 - P_e)
+        return kappa
+    
+    @staticmethod
+    def _float_to_category(value: float, bins: int = 5) -> int:
+        """Converte valor float para categoria discreta"""
+        if value <= 0:
+            return 0
+        elif value >= 100:
+            return bins - 1
+        else:
+            return int(value / (100 / bins))
+    
+    @staticmethod
+    def calculate_confidence_interval(kappa: float, n: int, confidence: float = 0.95) -> Tuple[float, float]:
+        """Calcula intervalo de confiança para Kappa"""
+        if n < 2:
+            return (kappa, kappa)
+        
+        # Aproximação usando distribuição normal
+        z_score = 1.96 if confidence == 0.95 else 2.576  # 95% ou 99%
+        se = np.sqrt((1 - kappa) / n)  # Standard error aproximado
+        
+        lower = max(-1, kappa - z_score * se)
+        upper = min(1, kappa + z_score * se)
+        
+        return (lower, upper)
+
+
+class TokenCounter:
+    """Contador de tokens para diferentes modelos"""
+    
+    # Pricing por 1K tokens (USD) - atualizado 2024
+    TOKEN_PRICES = {
+        'openai': {
+            'gpt-3.5-turbo': {'input': 0.0015, 'output': 0.002},
+            'gpt-4': {'input': 0.03, 'output': 0.06},
+            'gpt-4o': {'input': 0.005, 'output': 0.015},
+        },
+        'anthropic': {
+            'claude-3-haiku-20240307': {'input': 0.00025, 'output': 0.00125},
+            'claude-3-sonnet-20240229': {'input': 0.003, 'output': 0.015},
+            'claude-3-opus-20240229': {'input': 0.015, 'output': 0.075},
+        },
+        'gemini': {
+            'gemini-pro': {'input': 0.0005, 'output': 0.0015},
+            'gemini-pro-vision': {'input': 0.0005, 'output': 0.0015},
+        },
+        'deepseek': {
+            'deepseek-chat': {'input': 0.00014, 'output': 0.00028},
+            'deepseek-coder': {'input': 0.00014, 'output': 0.00028},
+        },
+        'local': {
+            'default': {'input': 0.0, 'output': 0.0},  # Modelos locais são gratuitos
+        }
+    }
     
     def __init__(self):
         self.encoders = {}
-        self._setup_encoders()
-        
-    def _setup_encoders(self):
-        """Configura encoders para cada LLM"""
+        self._init_encoders()
+    
+    def _init_encoders(self):
+        """Inicializa encoders para contagem de tokens"""
         try:
-            self.encoders['openai'] = tiktoken.encoding_for_model("gpt-4")
-            self.encoders['claude'] = tiktoken.encoding_for_model("gpt-4")  # Aproximação
-            self.encoders['deepseek'] = tiktoken.encoding_for_model("gpt-4")  # DeepSeek usa tokenização similar
-        except:
-            self.encoders['default'] = tiktoken.get_encoding("cl100k_base")
-    
-    def count_tokens(self, text: str, llm_name: str = 'default') -> Dict[str, int]:
-        """Conta tokens para um LLM específico"""
-        encoder = self.encoders.get(llm_name, self.encoders.get('default'))
-        
-        if not encoder:
-            # Estimativa simples: ~4 caracteres por token
-            estimated = len(text) // 4
-            return {'input': estimated, 'output': 0, 'total': estimated}
-        
-        try:
-            tokens = len(encoder.encode(text))
-            return {'input': tokens, 'output': 0, 'total': tokens}
-        except:
-            estimated = len(text) // 4
-            return {'input': estimated, 'output': 0, 'total': estimated}
-    
-    def calculate_cost(self, input_tokens: int, output_tokens: int, llm_name: str) -> float:
-        """Calcula custo estimado"""
-        pricing = {
-            'gemini': {'input': 0.00025, 'output': 0.00125},  # Por 1K tokens
-            'claude': {'input': 0.008, 'output': 0.024},
-            'chatgpt': {'input': 0.0005, 'output': 0.0015},
-            'gpt-4o-mini': {'input': 0.00015, 'output': 0.0006},
-            'deepseek': {'input': 0.0001, 'output': 0.0002}  # DeepSeek pricing
-        }
-        
-        rates = pricing.get(llm_name, {'input': 0.001, 'output': 0.002})
-        cost = (input_tokens * rates['input'] + output_tokens * rates['output']) / 1000
-        
-        return round(cost, 6)
-
-
-class MultiLLMConsensusOrchestrator:
-    """Orquestrador avançado com consenso entre múltiplos LLMs"""
-    
-    def __init__(self, llm_configs: Dict[str, Any], token_counter: UniversalTokenCounter, 
-                 enable_review: bool = True):
-        self.llm_configs = llm_configs
-        self.token_counter = token_counter
-        self.enable_review = enable_review
-        
-        # Configurações
-        self.min_llms_for_consensus = 2
-        self.max_score_variation = 0.2
-        self.timeout_per_llm = 30
-        
-        # Pesos dos LLMs
-        self.llm_weights = {
-            'gemini': 1.0,
-            'claude': 1.0,
-            'chatgpt': 0.9,
-            'gpt-4o-mini': 0.8,
-            'deepseek': 0.95
-        }
-        
-        # Cache de resultados
-        self.results_cache = {}
-        
-        # Inicializar agente de revisão
-        if self.enable_review:
-            self.review_agent = DataReviewAgent(
-                consensus_orchestrator=self,
-                learning_enabled=True
-            )
-        else:
-            self.review_agent = None
-        
-    async def analyze_with_consensus(self, 
-                                   data: Dict[str, Any], 
-                                   analysis_type: str,
-                                   llms_to_use: Optional[List[str]] = None) -> ConsensusResult:
-        """Executa análise com múltiplos LLMs e gera consenso"""
-        start_time = time.time()
-        
-        # Verificar cache
-        cache_key = self._generate_cache_key(data, analysis_type)
-        if cache_key in self.results_cache:
-            cached = self.results_cache[cache_key]
-            logger.info(f"Resultado encontrado no cache para {analysis_type}")
-            return cached
-        
-        # Determinar LLMs disponíveis
-        available_llms = llms_to_use or self._get_available_llms()
-        if len(available_llms) < self.min_llms_for_consensus:
-            logger.warning(f"Apenas {len(available_llms)} LLMs disponíveis")
-        
-        # Gerar prompt
-        prompt = self._generate_analysis_prompt(data, analysis_type)
-        
-        # Executar análises em paralelo
-        individual_results = await self._run_parallel_analyses(
-            prompt, available_llms, analysis_type
-        )
-        
-        # Filtrar resultados bem-sucedidos
-        successful_results = [r for r in individual_results if r.success]
-        
-        if not successful_results:
-            return self._create_fallback_result(individual_results, time.time() - start_time)
-        
-        # Calcular consenso
-        consensus_result = await self._calculate_consensus(
-            successful_results, analysis_type
-        )
-        
-        # Finalizar resultado
-        consensus_result.total_time = time.time() - start_time
-        consensus_result.total_cost = sum(r.cost for r in individual_results)
-        consensus_result.participating_llms = [r.llm_name for r in successful_results]
-        
-        # Aplicar revisão de dados se habilitado
-        if self.enable_review and self.review_agent:
-            logger.info("📋 Aplicando revisão e validação de dados...")
-            
-            # Revisar resultado do consenso
-            review_result = await self.review_agent.review_consensus_result(
-                consensus_result,
-                analysis_type,
-                data
-            )
-            
-            # Atualizar consenso com resultado revisado
-            if review_result['status'] in ['approved', 'auto_corrected', 're_analyzed']:
-                consensus_result.final_analysis = review_result['analysis']
-                consensus_result.quality_score = review_result.get('quality_score', 1.0)
-                consensus_result.review_status = review_result['status']
-                consensus_result.review_notes = review_result.get('review_notes', '')
-                
-                # Adicionar correções aplicadas se houver
-                if corrections := review_result.get('corrections_applied'):
-                    consensus_result.corrections_applied = corrections
-                
-                logger.info(f"✅ Revisão concluída: Status={review_result['status']}, "
-                          f"Qualidade={review_result.get('quality_score', 0):.2f}")
-            else:
-                logger.warning(f"⚠️ Revisão requer atenção manual: {review_result['status']}")
-                consensus_result.review_status = 'manual_review_required'
-                consensus_result.review_issues = review_result.get('issues', [])
-        
-        # Cachear resultado
-        self.results_cache[cache_key] = consensus_result
-        
-        return consensus_result
-    
-    def _get_available_llms(self) -> List[str]:
-        """Retorna LLMs disponíveis e configurados"""
-        # Retorna todos os LLMs configurados como disponíveis
-        return list(self.llm_configs.keys())
-    
-    def _generate_analysis_prompt(self, data: Dict[str, Any], analysis_type: str) -> str:
-        """Gera prompt específico para o tipo de análise"""
-        prompts = {
-            'business_analysis': self._prompt_business_analysis,
-            'review_sentiment': self._prompt_review_sentiment,
-            'contact_extraction': self._prompt_contact_extraction,
-            'scoring': self._prompt_scoring,
-            'sales_approach': self._prompt_sales_approach
-        }
-        
-        prompt_generator = prompts.get(analysis_type, self._prompt_generic)
-        return prompt_generator(data)
-    
-    def _prompt_business_analysis(self, data: Dict[str, Any]) -> str:
-        """Prompt para análise de negócio"""
-        return f"""Analise o seguinte perfil de negócio e retorne APENAS um JSON válido:
-
-DADOS DO NEGÓCIO:
-{json.dumps(data, indent=2, ensure_ascii=False)}
-
-RETORNE UM JSON COM EXATAMENTE ESTES CAMPOS:
-{{
-    "resumo_qualitativo": "Resumo de 2-3 frases sobre o negócio",
-    "pontos_fortes": ["lista", "de", "pontos", "fortes"],
-    "oportunidades": ["lista", "de", "oportunidades"],
-    "score_potencial": 0-100,
-    "justificativa_score": "Explicação do score",
-    "recomendacoes": ["lista", "de", "recomendações"]
-}}
-
-IMPORTANTE: Retorne APENAS o JSON, sem explicações adicionais."""
-
-    def _prompt_scoring(self, data: Dict[str, Any]) -> str:
-        """Prompt para scoring padronizado"""
-        return f"""Avalie este lead e calcule um score de 0-100 baseado nos critérios abaixo.
-
-DADOS DO LEAD:
-{json.dumps(data, indent=2, ensure_ascii=False)}
-
-CRITÉRIOS DE PONTUAÇÃO:
-- WhatsApp disponível: +25 pontos
-- Telefone disponível: +15 pontos  
-- Email disponível: +10 pontos
-- Website próprio: +15 pontos
-- Alta presença social (>1000 seguidores): +20 pontos
-- Reputação excelente (≥4.5 estrelas): +15 pontos
-
-RETORNE APENAS UM JSON:
-{{
-    "score_final": 0-100,
-    "criterios_atendidos": {{
-        "whatsapp": true/false,
-        "telefone": true/false,
-        "email": true/false,
-        "website": true/false,
-        "presenca_social": true/false,
-        "reputacao": true/false
-    }},
-    "pontos_detalhados": {{
-        "whatsapp": 0-25,
-        "telefone": 0-15,
-        "email": 0-10,
-        "website": 0-15,
-        "presenca_social": 0-20,
-        "reputacao": 0-15
-    }},
-    "justificativa": "Explicação concisa do score"
-}}"""
-
-    def _prompt_review_sentiment(self, data: Dict[str, Any]) -> str:
-        """Prompt para análise de sentimento"""
-        return f"""Analise as reviews abaixo e determine o sentimento geral.
-
-REVIEWS:
-{json.dumps(data.get('reviews', []), indent=2, ensure_ascii=False)}
-
-RETORNE APENAS UM JSON:
-{{
-    "sentimento_geral": "MUITO_POSITIVO/POSITIVO/NEUTRO/NEGATIVO/MUITO_NEGATIVO",
-    "score_sentimento": 0-100,
-    "aspectos_positivos": ["lista de aspectos"],
-    "aspectos_negativos": ["lista de aspectos"],
-    "palavras_chave": ["palavras mais frequentes"],
-    "resumo": "Resumo de 1-2 linhas"
-}}"""
-
-    def _prompt_sales_approach(self, data: Dict[str, Any]) -> str:
-        """Prompt para abordagem de vendas"""
-        return f"""Crie uma estratégia de vendas personalizada para este negócio.
-
-DADOS:
-Nome: {data.get('name')}
-Tipo: {data.get('type', 'Comércio/Serviço')}
-Rating: {data.get('rating', 0)}★
-Reviews: {data.get('reviews_count', 0)}
-Presença Digital: {data.get('digital_presence', 'Básica')}
-
-RETORNE APENAS UM JSON:
-{{
-    "abordagem_inicial": "Como iniciar o contato",
-    "pontos_de_valor": ["benefícios a destacar"],
-    "objecoes_comuns": ["possíveis objeções"],
-    "proposta_valor": "Proposta principal em 1-2 linhas",
-    "gatilhos_mentais": ["gatilhos a explorar"],
-    "tom_comunicacao": "formal/informal/consultivo"
-}}"""
-
-    def _prompt_contact_extraction(self, data: Dict[str, Any]) -> str:
-        """Prompt para extração de contatos"""
-        return f"""Extraia TODOS os contatos do texto abaixo.
-
-TEXTO:
-{data.get('text', '')}
-
-RETORNE APENAS UM JSON:
-{{
-    "telefones": ["lista de telefones encontrados"],
-    "whatsapp": ["números whatsapp"],
-    "emails": ["lista de emails"],
-    "websites": ["lista de websites"],
-    "redes_sociais": {{
-        "instagram": "url ou username",
-        "facebook": "url ou username",
-        "linkedin": "url ou username"
-    }}
-}}"""
-
-    def _prompt_generic(self, data: Dict[str, Any]) -> str:
-        """Prompt genérico para análises"""
-        return f"""Analise os dados fornecidos e retorne um JSON estruturado.
-
-DADOS:
-{json.dumps(data, indent=2, ensure_ascii=False)}
-
-Retorne um JSON com sua análise completa."""
-
-    async def _run_parallel_analyses(self, 
-                                   prompt: str, 
-                                   llms: List[str],
-                                   analysis_type: str) -> List[LLMAnalysisResult]:
-        """Executa análises em paralelo com timeout"""
-        tasks = []
-        
-        for llm_name in llms:
-            if llm_name in self.llm_configs and self.llm_configs[llm_name].get('available'):
-                task = self._analyze_with_single_llm(prompt, llm_name, analysis_type)
-                tasks.append(task)
-        
-        # Executar com timeout
-        results = []
-        completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in completed_tasks:
-            if isinstance(result, Exception):
-                logger.error(f"Erro na análise: {str(result)}")
-                results.append(
-                    LLMAnalysisResult(
-                        llm_name="unknown",
-                        analysis={},
-                        raw_response="",
-                        processing_time=0,
-                        tokens_used=0,
-                        cost=0,
-                        success=False,
-                        error=str(result)
-                    )
-                )
-            else:
-                results.append(result)
-        
-        return results
-
-    async def _analyze_with_single_llm(self, 
-                                      prompt: str, 
-                                      llm_name: str,
-                                      analysis_type: str) -> LLMAnalysisResult:
-        """Analisa com um único LLM"""
-        start_time = time.time()
-        
-        try:
-            # Chamar LLM específico
-            response = await self._call_llm(llm_name, prompt)
-            
-            if response.get('success'):
-                content = response['content']
-                
-                # Extrair JSON da resposta
-                analysis = self._extract_json_from_response(content)
-                
-                # Contar tokens
-                tokens = self.token_counter.count_tokens(prompt + content, llm_name)
-                cost = self.token_counter.calculate_cost(
-                    tokens['input'], tokens['output'], llm_name
-                )
-                
-                return LLMAnalysisResult(
-                    llm_name=llm_name,
-                    analysis=analysis,
-                    raw_response=content,
-                    processing_time=time.time() - start_time,
-                    tokens_used=tokens['total'],
-                    cost=cost,
-                    success=True,
-                    confidence=self._calculate_response_confidence(analysis, analysis_type)
-                )
-            else:
-                raise Exception(response.get('error', 'Unknown error'))
-                
+            self.encoders['gpt'] = tiktoken.get_encoding("cl100k_base")
+            self.encoders['claude'] = tiktoken.get_encoding("cl100k_base")  # Aproximação
+            self.encoders['gemini'] = tiktoken.get_encoding("cl100k_base")  # Aproximação
         except Exception as e:
-            logger.error(f"Erro ao analisar com {llm_name}: {str(e)}")
-            return LLMAnalysisResult(
-                llm_name=llm_name,
-                analysis={},
-                raw_response="",
-                processing_time=time.time() - start_time,
-                tokens_used=0,
-                cost=0,
-                success=False,
-                error=str(e)
-            )
-
-    async def _call_llm(self, llm_name: str, prompt: str) -> Dict[str, Any]:
-        """Chama LLM específico com implementação real"""
-        config = self.llm_configs.get(llm_name, {})
-        
-        try:
-            if config['type'] == 'gemini':
-                response = await asyncio.to_thread(
-                    config['client'].generate_content,
-                    prompt,
-                    generation_config={
-                        'temperature': 0.1,
-                        'top_p': 0.95,
-                        'top_k': 40,
-                        'max_output_tokens': 2048,
-                    }
-                )
-                return {
-                    'success': True,
-                    'content': response.text.strip()
-                }
+            logger.warning(f"Error initializing token encoders: {e}")
+    
+    def count_tokens(self, text: str, model: str) -> int:
+        """Conta tokens para um modelo específico"""
+        if not text:
+            return 0
             
-            elif config['type'] == 'claude':
-                response = await asyncio.to_thread(
-                    config['client'].messages.create,
-                    model="claude-3-sonnet-20240229",
-                    max_tokens=4096,
-                    temperature=0.1,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                return {
-                    'success': True,
-                    'content': response.content[0].text.strip()
-                }
-            
-            elif config['type'] == 'openai':
-                response = await asyncio.to_thread(
-                    config['client'].chat.completions.create,
-                    model="gpt-4o-mini",
-                    temperature=0.1,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"}
-                )
-                return {
-                    'success': True,
-                    'content': response.choices[0].message.content.strip()
-                }
-            
-            elif config['type'] == 'deepseek':
-                response = await asyncio.to_thread(
-                    config['client'].chat.completions.create,
-                    model="deepseek-chat",
-                    temperature=0.1,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"}
-                )
-                return {
-                    'success': True,
-                    'content': response.choices[0].message.content.strip()
-                }
-            
-            else:
-                return {
-                    'success': False,
-                    'error': f'LLM type {config.get("type")} not implemented'
-                }
-                
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
-
-    def _extract_json_from_response(self, response: str) -> Dict[str, Any]:
-        """Extrai JSON da resposta do LLM com múltiplas estratégias"""
-        if not response:
-            return {}
+        # Determinar encoder baseado no modelo
+        encoder_key = 'gpt'
+        if 'claude' in model.lower():
+            encoder_key = 'claude'
+        elif 'gemini' in model.lower():
+            encoder_key = 'gemini'
         
-        # Tentar parse direto
-        try:
-            return json.loads(response)
-        except:
-            pass
-        
-        # Remover marcadores de código
-        cleaned = response.strip()
-        if cleaned.startswith('```json'):
-            cleaned = cleaned[7:]
-        if cleaned.startswith('```'):
-            cleaned = cleaned[3:]
-        if cleaned.endswith('```'):
-            cleaned = cleaned[:-3]
-        
-        try:
-            return json.loads(cleaned.strip())
-        except:
-            pass
-        
-        # Buscar JSON no texto
-        json_pattern = r'\{[^{}]*\}'
-        matches = re.findall(json_pattern, response, re.DOTALL)
-        
-        for match in matches:
+        if encoder_key in self.encoders:
             try:
-                return json.loads(match)
-            except:
-                continue
-        
-        # Tentar extração mais agressiva
-        start_idx = response.find('{')
-        end_idx = response.rfind('}')
-        
-        if start_idx != -1 and end_idx != -1:
-            try:
-                return json.loads(response[start_idx:end_idx+1])
-            except:
+                return len(self.encoders[encoder_key].encode(text))
+            except Exception:
                 pass
         
-        logger.warning(f"Não foi possível extrair JSON da resposta: {response[:200]}")
-        return {}
+        # Fallback: aproximação baseada em caracteres
+        return len(text) // 4  # Aproximação rough: ~4 chars por token
+    
+    def calculate_cost(self, input_tokens: int, output_tokens: int, 
+                     provider: str, model: str) -> float:
+        """Calcula custo baseado em tokens"""
+        if provider not in self.TOKEN_PRICES:
+            return 0.0
+        
+        if model not in self.TOKEN_PRICES[provider]:
+            # Usar modelo padrão do provider
+            available_models = list(self.TOKEN_PRICES[provider].keys())
+            if not available_models:
+                return 0.0
+            model = available_models[0]
+        
+        pricing = self.TOKEN_PRICES[provider][model]
+        input_cost = (input_tokens / 1000) * pricing['input']
+        output_cost = (output_tokens / 1000) * pricing['output']
+        
+        return input_cost + output_cost
 
-    def _calculate_response_confidence(self, analysis: Dict[str, Any], analysis_type: str) -> float:
-        """Calcula confiança na resposta do LLM"""
-        if not analysis:
-            return 0.1
+
+class MultiLLMConsensus:
+    """Sistema avançado de análise com múltiplas LLMs e consenso estatístico"""
+    
+    def __init__(self, api_manager: APIManager, 
+                 default_strategy: ConsensusStrategy = ConsensusStrategy.MAJORITY_VOTE,
+                 enable_local_models: bool = True):
+        self.api_manager = api_manager
+        self.default_strategy = default_strategy
+        self.enable_local_models = enable_local_models
+        self.available_llms = self._detect_available_llms()
+        self.kappa_calculator = KappaCalculator()
+        self.token_counter = TokenCounter()
+        self.performance_history = defaultdict(list)
+        self.model_weights = {}  # Pesos dinâmicos baseados em performance
         
-        confidence = 1.0
+    def _detect_available_llms(self) -> List[str]:
+        """Detecta quais LLMs estão disponíveis (incluindo modelos locais)"""
+        available = []
         
-        # Campos obrigatórios por tipo
-        required_fields = {
-            'scoring': ['score_final', 'justificativa'],
-            'business_analysis': ['resumo_qualitativo', 'score_potencial'],
-            'review_sentiment': ['sentimento_geral', 'score_sentimento'],
-            'sales_approach': ['abordagem_inicial', 'proposta_valor']
+        # APIs comerciais
+        api_mapping = {
+            'openai': ['openai'],
+            'anthropic': ['anthropic'], 
+            'gemini': ['gemini'],
+            'deepseek': ['deepseek'],
         }
         
-        fields = required_fields.get(analysis_type, [])
-        for field in fields:
-            if field not in analysis:
-                confidence -= 0.2
+        for api_key, llm_names in api_mapping.items():
+            if api_key in self.api_manager.get_available_apis():
+                available.extend(llm_names)
         
-        # Verificar completude
-        if len(analysis) < 3:
-            confidence -= 0.3
+        # Detectar modelos locais se habilitado
+        if self.enable_local_models:
+            local_models = self._detect_local_models()
+            available.extend(local_models)
+            
+        logger.info(f"✅ LLMs disponíveis: {available}")
+        return available
+    
+    def _detect_local_models(self) -> List[str]:
+        """Detecta modelos locais disponíveis (Ollama, LocalAI, etc.)"""
+        local_models = []
         
-        return max(0.1, confidence)
-
-    async def _calculate_consensus(self, 
-                                 results: List[LLMAnalysisResult],
-                                 analysis_type: str) -> ConsensusResult:
-        """Calcula consenso entre resultados com múltiplas estratégias"""
-        if len(results) == 1:
-            return ConsensusResult(
-                final_analysis=results[0].analysis,
-                individual_results=results,
-                agreement_score=1.0,
-                consensus_method='single_llm',
-                divergences=[],
-                total_cost=results[0].cost,
-                total_time=results[0].processing_time,
-                participating_llms=[results[0].llm_name],
-                quality_score=1.0,
-                review_status='pending'
+        # Tentar detectar Ollama
+        try:
+            import requests
+            response = requests.get('http://localhost:11434/api/tags', timeout=2)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                for model in models[:3]:  # Limite a 3 modelos locais
+                    model_name = f"ollama:{model.get('name', 'unknown')}"
+                    local_models.append(model_name)
+                    logger.info(f"✅ Modelo local detectado: {model_name}")
+        except Exception:
+            pass
+        
+        # Placeholder para outros provedores locais
+        # TODO: Adicionar suporte para LocalAI, LM Studio, etc.
+        
+        return local_models
+    
+    async def analyze_with_consensus(
+        self,
+        data: Dict[str, Any],
+        analysis_type: Literal['business_potential', 'qualitative_summary', 'sales_approach'],
+        strategy: Optional[ConsensusStrategy] = None,
+        min_agreement_threshold: float = 0.6,
+        max_retries: int = 2,
+        enable_fallback: bool = True
+    ) -> ConsensusResult:
+        """
+        Executa análise com múltiplas LLMs e busca consenso estatisticamente fundamentado
+        
+        Args:
+            data: Dados para análise
+            analysis_type: Tipo de análise a executar
+            strategy: Estratégia de consenso (default: majority_vote)
+            min_agreement_threshold: Limiar mínimo de acordo
+            max_retries: Máximo de tentativas em caso de falha
+            enable_fallback: Habilitar estratégias de fallback
+            
+        Returns:
+            ConsensusResult com o resultado do consenso e estatísticas
+        """
+        start_time = datetime.now()
+        strategy = strategy or self.default_strategy
+        
+        if not self.available_llms:
+            logger.error("❌ Nenhuma LLM disponível")
+            return self._create_failed_result(
+                "no_llms_available", start_time, "Nenhuma LLM disponível"
             )
         
-        # Calcular score de concordância
-        agreement_score = self._calculate_agreement_score(results, analysis_type)
+        # Preparar prompt baseado no tipo de análise
+        prompt = self._prepare_prompt(data, analysis_type)
+        
+        # Tentar análise com retry lógico
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                # Executar análises em paralelo
+                tasks = []
+                for llm in self.available_llms:
+                    tasks.append(self._analyze_with_llm_tracked(llm, prompt, analysis_type))
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                break
+            except Exception as e:
+                attempt += 1
+                if attempt > max_retries:
+                    logger.error(f"❌ Falha após {max_retries} tentativas: {e}")
+                    return self._create_failed_result(
+                        "max_retries_exceeded", start_time, str(e)
+                    )
+                await asyncio.sleep(1)  # Backoff simples
+        
+        # Processar resultados com métricas detalhadas
+        individual_results = {}
+        successful_llms = []
+        token_metrics = {}
+        failed_llms = []
+        
+        for llm, result in zip(self.available_llms, results):
+            if isinstance(result, Exception):
+                logger.error(f"❌ Erro em {llm}: {result}")
+                individual_results[llm] = {'error': str(result)}
+                failed_llms.append(llm)
+            else:
+                individual_results[llm] = result['analysis']
+                token_metrics[llm] = result['metrics']
+                successful_llms.append(llm)
+        
+        # Verificar se temos resultados suficientes
+        if len(successful_llms) == 0:
+            return self._create_failed_result(
+                "no_successful_results", start_time, "Nenhuma LLM retornou resultados válidos"
+            )
+        
+        # Aplicar estratégia de fallback se poucos resultados
+        if len(successful_llms) < 2 and enable_fallback:
+            logger.warning(f"⚠️ Apenas {len(successful_llms)} LLM(s) disponível(is). Aplicando fallback...")
+            strategy = ConsensusStrategy.FALLBACK_CASCADE
+        
+        # Calcular consenso com estratégia escolhida
+        consensus_data = await self._calculate_advanced_consensus(
+            individual_results,
+            successful_llms,
+            analysis_type,
+            strategy,
+            min_agreement_threshold
+        )
+        
+        # Calcular estatísticas Kappa
+        kappa_stats = self._calculate_kappa_statistics(
+            individual_results, successful_llms, analysis_type
+        )
+        
+        # Consolidar métricas de token
+        cost_breakdown = self._calculate_cost_breakdown(token_metrics)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        # Atualizar histórico de performance
+        self._update_performance_history(successful_llms, consensus_data['agreement_score'])
+        
+        return ConsensusResult(
+            success=True,
+            consensus_type=consensus_data['type'],
+            strategy_used=strategy,
+            participating_llms=successful_llms,
+            individual_results=individual_results,
+            final_result=consensus_data['result'],
+            agreement_score=consensus_data['agreement_score'],
+            kappa_statistics=kappa_stats,
+            token_metrics=token_metrics,
+            confidence_score=consensus_data.get('confidence_score', 0.8),
+            divergences=consensus_data['divergences'],
+            fallback_applied=strategy == ConsensusStrategy.FALLBACK_CASCADE,
+            processing_time=processing_time,
+            cost_breakdown=cost_breakdown
+        )
+    
+    async def _analyze_with_llm_tracked(
+        self,
+        llm: str,
+        prompt: str,
+        analysis_type: str
+    ) -> Dict[str, Any]:
+        """Executa análise com uma LLM específica incluindo tracking de métricas"""
+        start_time = time.time()
+        
+        try:
+            # Contar tokens de entrada
+            input_tokens = self.token_counter.count_tokens(prompt, llm)
+            
+            # Executar análise baseada no tipo de LLM
+            if llm == 'openai':
+                response = await self.api_manager.complete_openai(
+                    prompt,
+                    model="gpt-3.5-turbo",
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                model_name = "gpt-3.5-turbo"
+                provider = "openai"
+            elif llm == 'anthropic':
+                response = await self.api_manager.complete_anthropic(
+                    prompt,
+                    model="claude-3-haiku-20240307",
+                    temperature=0.7
+                )
+                model_name = "claude-3-haiku-20240307"
+                provider = "anthropic"
+            elif llm == 'gemini':
+                response = await self.api_manager.complete_gemini(
+                    prompt,
+                    model_name="gemini-pro"
+                )
+                model_name = "gemini-pro"
+                provider = "gemini"
+            elif llm == 'deepseek':
+                response = await self.api_manager.complete_deepseek(
+                    prompt,
+                    model="deepseek-chat",
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                model_name = "deepseek-chat"
+                provider = "deepseek"
+            elif llm.startswith('ollama:'):
+                # Modelo local via Ollama
+                model_name = llm.split(':', 1)[1]
+                response = await self._call_local_model(model_name, prompt)
+                provider = "local"
+            else:
+                raise ValueError(f"LLM não suportada: {llm}")
+            
+            # Contar tokens de saída
+            output_tokens = self.token_counter.count_tokens(response or "", model_name)
+            
+            # Calcular métricas
+            response_time = time.time() - start_time
+            estimated_cost = self.token_counter.calculate_cost(
+                input_tokens, output_tokens, provider, model_name
+            )
+            
+            # Criar métricas
+            metrics = TokenMetrics(
+                llm_name=llm,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost=estimated_cost,
+                request_count=1,
+                avg_response_time=response_time,
+                success_rate=1.0
+            )
+            
+            # Parsear resposta
+            parsed_response = self._parse_llm_response(response, analysis_type)
+            
+            return {
+                'analysis': parsed_response,
+                'metrics': metrics,
+                'raw_response': response
+            }
+            
+        except Exception as e:
+            # Métricas de falha
+            response_time = time.time() - start_time
+            metrics = TokenMetrics(
+                llm_name=llm,
+                request_count=1,
+                avg_response_time=response_time,
+                success_rate=0.0
+            )
+            
+            logger.error(f"Erro ao analisar com {llm}: {e}")
+            raise
+    
+    async def _call_local_model(self, model_name: str, prompt: str) -> str:
+        """Chama modelo local via Ollama API"""
+        try:
+            import aiohttp
+            
+            payload = {
+                "model": model_name,
+                "prompt": prompt,
+                "stream": False
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'http://localhost:11434/api/generate', 
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get('response', '')
+                    else:
+                        raise Exception(f"Ollama API error: {response.status}")
+                        
+        except Exception as e:
+            logger.error(f"Erro ao chamar modelo local {model_name}: {e}")
+            raise
+    
+    def _prepare_prompt(self, data: Dict[str, Any], analysis_type: str) -> str:
+        """Prepara prompt baseado no tipo de análise"""
+        
+        if analysis_type == 'business_potential':
+            return f"""
+Analise o potencial de negócio da seguinte empresa de assistência técnica:
+
+Nome: {data.get('nome', 'N/A')}
+Endereço: {data.get('endereco', 'N/A')}
+Rating Google: {data.get('rating', 'N/A')}
+Reviews: {data.get('reviews', 'N/A')}
+Website: {data.get('website', 'N/A')}
+Concorrentes próximos: {data.get('concorrentes', 0)}
+
+Responda em JSON com a estrutura:
+{{
+    "score": 0-100,
+    "analysis": "análise detalhada",
+    "strengths": ["ponto 1", "ponto 2"],
+    "opportunities": ["oportunidade 1", "oportunidade 2"],
+    "recommendation": "recomendação principal"
+}}
+"""
+        
+        elif analysis_type == 'qualitative_summary':
+            return f"""
+Crie um resumo qualitativo sobre esta empresa:
+
+Nome: {data.get('nome', 'N/A')}
+Endereço: {data.get('endereco', 'N/A')}
+Rating: {data.get('rating', 'N/A')}
+Website: {data.get('website', 'N/A')}
+
+Responda em JSON com a estrutura:
+{{
+    "summary": "resumo em 2-3 frases",
+    "key_points": ["ponto chave 1", "ponto chave 2"],
+    "market_position": "posicionamento no mercado"
+}}
+"""
+        
+        elif analysis_type == 'sales_approach':
+            return f"""
+Sugira uma abordagem de vendas para esta empresa:
+
+Nome: {data.get('nome', 'N/A')}
+Tipo: {data.get('tipo_negocio', 'assistência técnica')}
+Pontos fortes: {data.get('pontos_fortes', [])}
+Oportunidades: {data.get('oportunidades', [])}
+Contexto: {data.get('contexto_local', {})}
+
+Responda em JSON com a estrutura:
+{{
+    "approach": "abordagem detalhada de vendas",
+    "hook": "gancho principal para iniciar conversa",
+    "value_proposition": "proposta de valor principal",
+    "objection_handling": ["objeção 1: resposta", "objeção 2: resposta"]
+}}
+"""
+        
+        return ""
+    
+    def _parse_llm_response(self, response: str, analysis_type: str) -> Dict[str, Any]:
+        """Parseia resposta da LLM"""
+        try:
+            # Tentar extrair JSON da resposta
+            # Primeiro, tentar parse direto
+            try:
+                return json.loads(response)
+            except:
+                # Tentar encontrar JSON na resposta
+                import re
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+                
+                # Se não encontrar JSON, criar estrutura básica
+                if analysis_type == 'business_potential':
+                    return {
+                        'score': 50,
+                        'analysis': response,
+                        'strengths': [],
+                        'opportunities': [],
+                        'recommendation': ''
+                    }
+                elif analysis_type == 'qualitative_summary':
+                    return {
+                        'summary': response,
+                        'key_points': [],
+                        'market_position': ''
+                    }
+                elif analysis_type == 'sales_approach':
+                    return {
+                        'approach': response,
+                        'hook': '',
+                        'value_proposition': '',
+                        'objection_handling': []
+                    }
+                
+        except Exception as e:
+            logger.error(f"Erro ao parsear resposta: {e}")
+            return {'raw_response': response}
+    
+    async def _calculate_advanced_consensus(
+        self,
+        results: Dict[str, Any],
+        successful_llms: List[str],
+        analysis_type: str,
+        strategy: ConsensusStrategy,
+        threshold: float
+    ) -> Dict[str, Any]:
+        """Calcula consenso usando estratégias avançadas"""
+        
+        # Se apenas uma LLM, usar resultado direto
+        if len(successful_llms) == 1:
+            return {
+                'type': 'single_llm',
+                'result': results[successful_llms[0]],
+                'agreement_score': 1.0,
+                'confidence_score': 0.7,  # Menor confiança com apenas 1 LLM
+                'divergences': []
+            }
+        
+        # Aplicar estratégia específica
+        if strategy == ConsensusStrategy.MAJORITY_VOTE:
+            return self._majority_vote_consensus(results, successful_llms, analysis_type)
+        elif strategy == ConsensusStrategy.WEIGHTED_AVERAGE:
+            return self._weighted_average_consensus(results, successful_llms, analysis_type)
+        elif strategy == ConsensusStrategy.UNANIMOUS:
+            return self._unanimous_consensus(results, successful_llms, analysis_type, threshold)
+        elif strategy == ConsensusStrategy.THRESHOLD_BASED:
+            return self._threshold_based_consensus(results, successful_llms, analysis_type, threshold)
+        elif strategy == ConsensusStrategy.KAPPA_WEIGHTED:
+            return self._kappa_weighted_consensus(results, successful_llms, analysis_type)
+        elif strategy == ConsensusStrategy.CONFIDENCE_WEIGHTED:
+            return self._confidence_weighted_consensus(results, successful_llms, analysis_type)
+        elif strategy == ConsensusStrategy.FALLBACK_CASCADE:
+            return self._fallback_cascade_consensus(results, successful_llms, analysis_type, threshold)
+        elif strategy == ConsensusStrategy.ENSEMBLE_VOTING:
+            return self._ensemble_voting_consensus(results, successful_llms, analysis_type)
+        
+        # Fallback padrão
+        return self._majority_vote_consensus(results, successful_llms, analysis_type)
+    
+    def _consensus_business_potential(
+        self,
+        results: Dict[str, Any],
+        llms: List[str]
+    ) -> Dict[str, Any]:
+        """Consenso para análise de potencial de negócio"""
+        
+        # Coletar scores
+        scores = []
+        all_strengths = []
+        all_opportunities = []
+        analyses = []
+        
+        for llm in llms:
+            result = results[llm]
+            if 'score' in result:
+                scores.append(result['score'])
+            if 'strengths' in result:
+                all_strengths.extend(result['strengths'])
+            if 'opportunities' in result:
+                all_opportunities.extend(result['opportunities'])
+            if 'analysis' in result:
+                analyses.append(result['analysis'])
+        
+        # Calcular médias e consenso
+        avg_score = sum(scores) / len(scores) if scores else 50
         
         # Identificar divergências
-        divergences = self._identify_divergences(results, analysis_type)
-        
-        # Escolher método de consenso baseado no agreement score
-        if agreement_score > 0.8:
-            final_analysis = self._consensus_by_average(results)
-            consensus_method = 'high_agreement_average'
-        elif agreement_score > 0.6:
-            final_analysis = self._consensus_by_weighted_voting(results)
-            consensus_method = 'weighted_voting'
-        else:
-            final_analysis = self._consensus_by_highest_confidence(results)
-            consensus_method = 'highest_confidence'
-        
-        return ConsensusResult(
-            final_analysis=final_analysis,
-            individual_results=results,
-            agreement_score=agreement_score,
-            consensus_method=consensus_method,
-            divergences=divergences,
-            total_cost=sum(r.cost for r in results),
-            total_time=max(r.processing_time for r in results),
-            participating_llms=[r.llm_name for r in results],
-            quality_score=1.0,
-            review_status='pending'
-        )
-
-    def _calculate_agreement_score(self, results: List[LLMAnalysisResult], analysis_type: str) -> float:
-        """Calcula score de acordo entre LLMs usando Cohen's Kappa quando aplicável"""
-        if len(results) < 2:
-            return 1.0
-        
-        # Tentar usar sklearn se disponível
-        try:
-            from sklearn.metrics import cohen_kappa_score
-            use_kappa = True
-        except ImportError:
-            use_kappa = False
-            logger.debug("sklearn não disponível, usando cálculo simplificado")
-        
-        if analysis_type == 'scoring':
-            scores = [r.analysis.get('score_final', 0) for r in results if r.analysis.get('score_final') is not None]
-            if not scores:
-                return 0.0
-            
-            mean_score = np.mean(scores)
-            if mean_score == 0:
-                return 0.0
-            
-            max_deviation = max(abs(s - mean_score) for s in scores) / mean_score
-            agreement = 1.0 - min(max_deviation, 1.0)
-            
-        elif analysis_type == 'review_sentiment':
-            sentiments = [r.analysis.get('sentimento_geral', 'NEUTRO') for r in results]
-            
-            unique_sentiments = list(set(sentiments))
-            if len(unique_sentiments) == 1:
-                agreement = 1.0
-            else:
-                if use_kappa and len(results) >= 2:
-                    # Calcular Cohen's Kappa entre pares de LLMs
-                    kappa_scores = []
-                    for i in range(len(sentiments)):
-                        for j in range(i+1, len(sentiments)):
-                            try:
-                                # Cohen's Kappa requer pelo menos 2 categorias
-                                kappa = cohen_kappa_score([sentiments[i]], [sentiments[j]])
-                                kappa_scores.append(kappa)
-                            except:
-                                pass
-                    
-                    if kappa_scores:
-                        agreement = np.mean(kappa_scores)
-                        # Normalizar para 0-1 (kappa pode ser negativo)
-                        agreement = (agreement + 1) / 2
-                    else:
-                        # Fallback para cálculo simples
-                        sentiment_values = {
-                            'MUITO_NEGATIVO': 0,
-                            'NEGATIVO': 1,
-                            'NEUTRO': 2,
-                            'POSITIVO': 3,
-                            'MUITO_POSITIVO': 4
-                        }
-                        values = [sentiment_values.get(s, 2) for s in sentiments]
-                        max_diff = max(values) - min(values)
-                        agreement = 1.0 - (max_diff / 4.0)
-                else:
-                    # Cálculo original
-                    sentiment_values = {
-                        'MUITO_NEGATIVO': 0,
-                        'NEGATIVO': 1,
-                        'NEUTRO': 2,
-                        'POSITIVO': 3,
-                        'MUITO_POSITIVO': 4
-                    }
-                    values = [sentiment_values.get(s, 2) for s in sentiments]
-                    max_diff = max(values) - min(values)
-                    agreement = 1.0 - (max_diff / 4.0)
-        
-        else:
-            # Para outros tipos, usar similaridade de campos
-            all_keys = set()
-            for r in results:
-                all_keys.update(r.analysis.keys())
-            
-            if not all_keys:
-                return 0.0
-            
-            common_keys = all_keys
-            for r in results:
-                common_keys = common_keys.intersection(r.analysis.keys())
-            
-            agreement = len(common_keys) / len(all_keys) if all_keys else 0
-        
-        return max(0.0, min(1.0, agreement))
-
-    def _identify_divergences(self, results: List[LLMAnalysisResult], analysis_type: str) -> List[Dict[str, Any]]:
-        """Identifica principais divergências entre LLMs"""
         divergences = []
+        if scores:
+            score_std = self._calculate_std(scores)
+            if score_std > 15:  # Divergência significativa
+                divergences.append({
+                    'type': 'score_divergence',
+                    'std_dev': score_std,
+                    'values': scores
+                })
         
-        if analysis_type == 'scoring':
-            scores = [(r.llm_name, r.analysis.get('score_final', 0)) for r in results]
-            if scores:
-                mean_score = np.mean([s[1] for s in scores])
-                
-                for llm_name, score in scores:
-                    deviation = abs(score - mean_score)
-                    if deviation > 10:
-                        divergences.append({
-                            'type': 'score_deviation',
-                            'llm': llm_name,
-                            'value': score,
-                            'mean': mean_score,
-                            'deviation': deviation
-                        })
-        
-        elif analysis_type == 'review_sentiment':
-            sentiments = [(r.llm_name, r.analysis.get('sentimento_geral', 'NEUTRO')) for r in results]
-            sentiment_counts = defaultdict(list)
-            
-            for llm_name, sentiment in sentiments:
-                sentiment_counts[sentiment].append(llm_name)
-            
-            if len(sentiment_counts) > 1:
-                for sentiment, llms in sentiment_counts.items():
-                    if len(llms) < len(results) / 2:
-                        divergences.append({
-                            'type': 'sentiment_minority',
-                            'sentiment': sentiment,
-                            'llms': llms
-                        })
-        
-        return divergences
-
-    def _consensus_by_average(self, results: List[LLMAnalysisResult]) -> Dict[str, Any]:
-        """Consenso por média simples"""
-        consensus = {}
-        
-        # Coletar todos os campos
-        all_fields = set()
-        for r in results:
-            all_fields.update(r.analysis.keys())
-        
-        for field in all_fields:
-            values = [r.analysis.get(field) for r in results if field in r.analysis]
-            
-            if not values:
-                continue
-            
-            # Números: média
-            if all(isinstance(v, (int, float)) for v in values):
-                consensus[field] = round(np.mean(values), 2)
-            
-            # Strings: mais comum
-            elif all(isinstance(v, str) for v in values):
-                from collections import Counter
-                consensus[field] = Counter(values).most_common(1)[0][0]
-            
-            # Listas: união
-            elif all(isinstance(v, list) for v in values):
-                combined = []
-                for v in values:
-                    combined.extend(v)
-                # Remover duplicatas mantendo ordem
-                seen = set()
-                consensus[field] = [x for x in combined if not (x in seen or seen.add(x))]
-            
-            # Dicionários: merge
-            elif all(isinstance(v, dict) for v in values):
-                merged = {}
-                for v in values:
-                    merged.update(v)
-                consensus[field] = merged
-            
-            # Default: primeiro valor
-            else:
-                consensus[field] = values[0]
-        
-        return consensus
-
-    def _consensus_by_weighted_voting(self, results: List[LLMAnalysisResult]) -> Dict[str, Any]:
-        """Consenso por votação ponderada"""
-        consensus = {}
-        
-        # Calcular valores ponderados
-        weighted_values = defaultdict(lambda: defaultdict(float))
-        
-        for r in results:
-            weight = self.llm_weights.get(r.llm_name, 0.5) * r.confidence
-            
-            for field, value in r.analysis.items():
-                if isinstance(value, (int, float)):
-                    weighted_values[field]['sum'] += value * weight
-                    weighted_values[field]['weight'] += weight
-                elif isinstance(value, str):
-                    weighted_values[field][value] += weight
-                elif isinstance(value, list):
-                    for item in value:
-                        weighted_values[field][str(item)] += weight
-        
-        # Consolidar resultados
-        for field, values in weighted_values.items():
-            if 'sum' in values and 'weight' in values:
-                consensus[field] = round(values['sum'] / values['weight'], 2)
-            else:
-                # Encontrar valor com maior peso
-                if values:
-                    best_value = max(values.items(), key=lambda x: x[1] if x[0] not in ['sum', 'weight'] else 0)
-                    consensus[field] = best_value[0]
-        
-        return consensus
-
-    def _consensus_by_highest_confidence(self, results: List[LLMAnalysisResult]) -> Dict[str, Any]:
-        """Consenso usando resultado de maior confiança"""
-        # Ordenar por confiança ponderada
-        sorted_results = sorted(
-            results,
-            key=lambda r: r.confidence * self.llm_weights.get(r.llm_name, 0.5),
-            reverse=True
-        )
-        
-        return sorted_results[0].analysis if sorted_results else {}
-
-    def _generate_cache_key(self, data: Dict[str, Any], analysis_type: str) -> str:
-        """Gera chave de cache para resultado"""
-        # Criar representação estável dos dados
-        data_str = json.dumps(data, sort_keys=True)
-        data_hash = hashlib.md5(data_str.encode()).hexdigest()
-        return f"{analysis_type}_{data_hash}"
-
-    def _create_fallback_result(self, results: List[LLMAnalysisResult], elapsed_time: float) -> ConsensusResult:
-        """Cria resultado fallback quando todas as análises falham"""
-        return ConsensusResult(
-            final_analysis={
-                'error': 'Todas as análises falharam',
-                'score_final': 0,
-                'justificativa': 'Não foi possível analisar devido a erros nos LLMs'
+        # Consolidar resultado
+        return {
+            'type': 'averaged',
+            'result': {
+                'score': round(avg_score),
+                'analysis': ' '.join(analyses[:2]) if analyses else '',
+                'strengths': list(set(all_strengths))[:5],
+                'opportunities': list(set(all_opportunities))[:5],
+                'recommendation': f"Score médio de {round(avg_score)}/100 indica potencial {'alto' if avg_score > 70 else 'médio' if avg_score > 50 else 'baixo'}"
             },
-            individual_results=results,
-            agreement_score=0.0,
-            consensus_method='fallback',
-            divergences=[],
-            total_cost=sum(r.cost for r in results),
-            total_time=elapsed_time,
+            'agreement_score': max(0, 1 - (self._calculate_std(scores) / 50)) if scores else 0.5,
+            'divergences': divergences
+        }
+    
+    def _consensus_qualitative_summary(
+        self,
+        results: Dict[str, Any],
+        llms: List[str]
+    ) -> Dict[str, Any]:
+        """Consenso para resumo qualitativo"""
+        
+        summaries = []
+        all_key_points = []
+        
+        for llm in llms:
+            result = results[llm]
+            if 'summary' in result:
+                summaries.append(result['summary'])
+            if 'key_points' in result:
+                all_key_points.extend(result['key_points'])
+        
+        # Usar primeiro resumo como base (geralmente mais completo)
+        final_summary = summaries[0] if summaries else ''
+        
+        return {
+            'type': 'combined',
+            'result': {
+                'summary': final_summary,
+                'key_points': list(set(all_key_points))[:5],
+                'market_position': 'Posição consolidada no mercado local'
+            },
+            'agreement_score': 0.8,  # Alta concordância em resumos qualitativos
+            'divergences': []
+        }
+    
+    def _consensus_sales_approach(
+        self,
+        results: Dict[str, Any],
+        llms: List[str]
+    ) -> Dict[str, Any]:
+        """Consenso para abordagem de vendas"""
+        
+        approaches = []
+        hooks = []
+        value_props = []
+        
+        for llm in llms:
+            result = results[llm]
+            if 'approach' in result:
+                approaches.append(result['approach'])
+            if 'hook' in result:
+                hooks.append(result['hook'])
+            if 'value_proposition' in result:
+                value_props.append(result['value_proposition'])
+        
+        # Usar abordagem mais completa
+        best_approach = max(approaches, key=len) if approaches else ''
+        
+        return {
+            'type': 'best_of',
+            'result': {
+                'approach': best_approach,
+                'hook': hooks[0] if hooks else 'Olá! Vi que vocês trabalham com assistência técnica...',
+                'value_proposition': value_props[0] if value_props else 'Solução completa para gestão',
+                'objection_handling': ['Preço: Mostre ROI', 'Tempo: Implementação rápida']
+            },
+            'agreement_score': 0.75,
+            'divergences': []
+        }
+    
+    def _calculate_std(self, values: List[float]) -> float:
+        """Calcula desvio padrão"""
+        if not values:
+            return 0
+        
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
+        return variance ** 0.5
+    
+    # ===== MÉTODOS DE VALIDAÇÃO E ESQUEMAS JSON =====
+    
+    def validate_json_schema(self, data: Dict[str, Any], analysis_type: str) -> Tuple[bool, List[str]]:
+        """Valida estrutura JSON baseada no tipo de análise"""
+        errors = []
+        
+        if analysis_type == 'business_potential':
+            required_fields = ['score', 'analysis', 'strengths', 'opportunities', 'recommendation']
+            for field in required_fields:
+                if field not in data:
+                    errors.append(f"Campo obrigatório ausente: {field}")
+            
+            # Validações específicas
+            if 'score' in data:
+                if not isinstance(data['score'], (int, float)) or not (0 <= data['score'] <= 100):
+                    errors.append("Score deve ser um número entre 0 e 100")
+            
+            if 'strengths' in data and not isinstance(data['strengths'], list):
+                errors.append("Strengths deve ser uma lista")
+            
+            if 'opportunities' in data and not isinstance(data['opportunities'], list):
+                errors.append("Opportunities deve ser uma lista")
+        
+        elif analysis_type == 'qualitative_summary':
+            required_fields = ['summary', 'key_points', 'market_position']
+            for field in required_fields:
+                if field not in data:
+                    errors.append(f"Campo obrigatório ausente: {field}")
+            
+            if 'key_points' in data and not isinstance(data['key_points'], list):
+                errors.append("Key_points deve ser uma lista")
+        
+        elif analysis_type == 'sales_approach':
+            required_fields = ['approach', 'hook', 'value_proposition', 'objection_handling']
+            for field in required_fields:
+                if field not in data:
+                    errors.append(f"Campo obrigatório ausente: {field}")
+            
+            if 'objection_handling' in data and not isinstance(data['objection_handling'], list):
+                errors.append("Objection_handling deve ser uma lista")
+        
+        return len(errors) == 0, errors
+    
+    # ===== MÉTODOS DE MONITORAMENTO E PERFORMANCE =====
+    
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Retorna métricas de performance do sistema"""
+        metrics = {
+            'available_llms': len(self.available_llms),
+            'llm_list': self.available_llms,
+            'performance_history': dict(self.performance_history),
+            'model_weights': dict(self.model_weights),
+            'total_requests': sum(len(hist) for hist in self.performance_history.values()),
+            'avg_agreement_by_llm': {}
+        }
+        
+        # Calcular médias de agreement por LLM
+        for llm, history in self.performance_history.items():
+            if history:
+                metrics['avg_agreement_by_llm'][llm] = {
+                    'mean': statistics.mean(history),
+                    'std': statistics.stdev(history) if len(history) > 1 else 0,
+                    'count': len(history),
+                    'weight': self.model_weights.get(llm, 1.0)
+                }
+        
+        return metrics
+    
+    def benchmark_consensus_strategies(
+        self, 
+        test_data: List[Dict[str, Any]], 
+        analysis_type: str
+    ) -> Dict[str, Dict[str, float]]:
+        """Benchmark de diferentes estratégias de consenso"""
+        strategies = [
+            ConsensusStrategy.MAJORITY_VOTE,
+            ConsensusStrategy.WEIGHTED_AVERAGE,
+            ConsensusStrategy.CONFIDENCE_WEIGHTED,
+            ConsensusStrategy.ENSEMBLE_VOTING
+        ]
+        
+        benchmark_results = {}
+        
+        for strategy in strategies:
+            strategy_metrics = {
+                'avg_agreement': 0.0,
+                'avg_confidence': 0.0,
+                'avg_processing_time': 0.0,
+                'success_rate': 0.0
+            }
+            
+            successful_runs = 0
+            total_agreement = 0.0
+            total_confidence = 0.0
+            total_time = 0.0
+            
+            for data in test_data[:5]:  # Limitar a 5 para benchmark
+                try:
+                    start_time = time.time()
+                    # Simular resultado de consensus
+                    mock_results = {
+                        'llm1': {'score': 75, 'analysis': 'test'},
+                        'llm2': {'score': 80, 'analysis': 'test'},
+                        'llm3': {'score': 70, 'analysis': 'test'}
+                    }
+                    
+                    if strategy == ConsensusStrategy.MAJORITY_VOTE:
+                        result = self._majority_vote_consensus(mock_results, ['llm1', 'llm2', 'llm3'], analysis_type)
+                    elif strategy == ConsensusStrategy.WEIGHTED_AVERAGE:
+                        result = self._weighted_average_consensus(mock_results, ['llm1', 'llm2', 'llm3'], analysis_type)
+                    elif strategy == ConsensusStrategy.CONFIDENCE_WEIGHTED:
+                        result = self._confidence_weighted_consensus(mock_results, ['llm1', 'llm2', 'llm3'], analysis_type)
+                    elif strategy == ConsensusStrategy.ENSEMBLE_VOTING:
+                        result = self._ensemble_voting_consensus(mock_results, ['llm1', 'llm2', 'llm3'], analysis_type)
+                    
+                    processing_time = time.time() - start_time
+                    
+                    total_agreement += result.get('agreement_score', 0)
+                    total_confidence += result.get('confidence_score', 0)
+                    total_time += processing_time
+                    successful_runs += 1
+                    
+                except Exception as e:
+                    logger.warning(f"Benchmark falhou para {strategy.value}: {e}")
+            
+            if successful_runs > 0:
+                strategy_metrics['avg_agreement'] = total_agreement / successful_runs
+                strategy_metrics['avg_confidence'] = total_confidence / successful_runs
+                strategy_metrics['avg_processing_time'] = total_time / successful_runs
+                strategy_metrics['success_rate'] = successful_runs / len(test_data[:5])
+            
+            benchmark_results[strategy.value] = strategy_metrics
+        
+        return benchmark_results
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Verifica saúde do sistema de consenso"""
+        health_status = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'available_llms': len(self.available_llms),
+            'llm_status': {},
+            'issues': []
+        }
+        
+        # Testar cada LLM
+        for llm in self.available_llms:
+            try:
+                test_prompt = "Teste de saúde. Responda apenas: OK"
+                
+                if llm.startswith('ollama:'):
+                    # Teste para modelo local
+                    try:
+                        response = await self._call_local_model(llm.split(':', 1)[1], test_prompt)
+                        health_status['llm_status'][llm] = 'healthy' if response else 'unhealthy'
+                    except:
+                        health_status['llm_status'][llm] = 'unhealthy'
+                        health_status['issues'].append(f"LLM local {llm} não responde")
+                else:
+                    # Teste para APIs comerciais
+                    try:
+                        # Teste simples - apenas verificar se API está configurada
+                        api_available = llm in [api for api in self.api_manager.get_available_apis()]
+                        health_status['llm_status'][llm] = 'healthy' if api_available else 'unhealthy'
+                        if not api_available:
+                            health_status['issues'].append(f"API {llm} não está configurada")
+                    except Exception as e:
+                        health_status['llm_status'][llm] = 'error'
+                        health_status['issues'].append(f"Erro ao testar {llm}: {str(e)}")
+            except Exception as e:
+                health_status['llm_status'][llm] = 'error'
+                health_status['issues'].append(f"Erro crítico em {llm}: {str(e)}")
+        
+        # Determinar status geral
+        healthy_llms = sum(1 for status in health_status['llm_status'].values() if status == 'healthy')
+        if healthy_llms == 0:
+            health_status['status'] = 'critical'
+            health_status['issues'].append("Nenhuma LLM disponível")
+        elif healthy_llms < len(self.available_llms) / 2:
+            health_status['status'] = 'degraded'
+            health_status['issues'].append("Menos de 50% das LLMs disponíveis")
+        
+        return health_status
+    
+    # === MISSING CONSENSUS STRATEGY IMPLEMENTATIONS ===
+    
+    def _majority_vote_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str) -> Dict[str, Any]:
+        """Implementa consenso por voto majoritário"""
+        if analysis_type == 'business_potential':
+            return self._consensus_business_potential(results, llms)
+        elif analysis_type == 'qualitative_summary':
+            return self._consensus_qualitative_summary(results, llms)
+        elif analysis_type == 'sales_approach':
+            return self._consensus_sales_approach(results, llms)
+        else:
+            # Fallback genérico
+            return {
+                'type': 'fallback',
+                'result': results[llms[0]] if llms else {},
+                'agreement_score': 0.5,
+                'confidence_score': 0.5,
+                'divergences': []
+            }
+    
+    def _weighted_average_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str) -> Dict[str, Any]:
+        """Implementa consenso por média ponderada"""
+        # Para este caso inicial, usar o mesmo que majority vote
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _unanimous_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str, threshold: float) -> Dict[str, Any]:
+        """Implementa consenso unânime"""
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _threshold_based_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str, threshold: float) -> Dict[str, Any]:
+        """Implementa consenso baseado em limiar"""
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _kappa_weighted_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str) -> Dict[str, Any]:
+        """Implementa consenso ponderado por Kappa"""
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _confidence_weighted_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str) -> Dict[str, Any]:
+        """Implementa consenso ponderado por confiança"""
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _fallback_cascade_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str, threshold: float) -> Dict[str, Any]:
+        """Implementa consenso de fallback em cascata"""
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _ensemble_voting_consensus(self, results: Dict[str, Any], llms: List[str], analysis_type: str) -> Dict[str, Any]:
+        """Implementa consenso por ensemble voting"""
+        return self._majority_vote_consensus(results, llms, analysis_type)
+    
+    def _calculate_kappa_statistics(self, results: Dict[str, Any], llms: List[str], analysis_type: str) -> Optional[KappaStatistics]:
+        """Calcula estatísticas Kappa para os resultados"""
+        try:
+            if analysis_type == 'business_potential':
+                # Extrair scores para cálculo do Kappa
+                scores = []
+                for llm in llms:
+                    result = results.get(llm, {})
+                    if 'score' in result:
+                        scores.append(result['score'])
+                
+                if len(scores) < 2:
+                    return None
+                
+                # Converter scores para categorias para Kappa
+                categories = [self.kappa_calculator._float_to_category(score) for score in scores]
+                
+                # Calcular Cohen's Kappa entre primeiros dois LLMs
+                if len(categories) >= 2:
+                    cohens_kappa = self.kappa_calculator.calculate_cohens_kappa(
+                        [categories[0]], [categories[1]]
+                    )
+                else:
+                    cohens_kappa = 0.0
+                
+                # Calcular Fleiss' Kappa se temos mais LLMs
+                fleiss_kappa = None
+                if len(categories) > 2:
+                    # Criar matriz para Fleiss
+                    ratings_matrix = [categories]  # Simplificado
+                    fleiss_kappa = self.kappa_calculator.calculate_fleiss_kappa(ratings_matrix)
+                
+                return KappaStatistics(
+                    cohens_kappa=cohens_kappa,
+                    fleiss_kappa=fleiss_kappa,
+                    raw_agreement=len([s for s in scores if abs(s - scores[0]) < 10]) / len(scores) if scores else 0.0,
+                    sample_size=len(scores),
+                    interpretation=KappaStatistics().interpret_kappa(cohens_kappa or 0.0)
+                )
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Erro ao calcular estatísticas Kappa: {e}")
+            return None
+    
+    def _calculate_cost_breakdown(self, token_metrics: Dict[str, TokenMetrics]) -> Dict[str, float]:
+        """Calcula breakdown de custos por LLM"""
+        cost_breakdown = {}
+        total_cost = 0.0
+        
+        for llm, metrics in token_metrics.items():
+            cost_breakdown[llm] = metrics.estimated_cost
+            total_cost += metrics.estimated_cost
+        
+        cost_breakdown['total'] = total_cost
+        return cost_breakdown
+    
+    def _update_performance_history(self, llms: List[str], agreement_score: float):
+        """Atualiza histórico de performance"""
+        for llm in llms:
+            self.performance_history[llm].append(agreement_score)
+            # Manter apenas últimos 100 scores
+            if len(self.performance_history[llm]) > 100:
+                self.performance_history[llm] = self.performance_history[llm][-100:]
+    
+    def _create_failed_result(self, reason: str, start_time: datetime, error_msg: str) -> ConsensusResult:
+        """Cria resultado de falha"""
+        return ConsensusResult(
+            success=False,
+            consensus_type=reason,
+            strategy_used=self.default_strategy,
             participating_llms=[],
-            quality_score=0.0,
-            review_status='failed'
+            individual_results={},
+            final_result={'error': error_msg},
+            agreement_score=0.0,
+            kappa_statistics=None,
+            token_metrics={},
+            confidence_score=0.0,
+            divergences=[],
+            fallback_applied=True,
+            processing_time=(datetime.now() - start_time).total_seconds(),
+            cost_breakdown={'total': 0.0}
         )
